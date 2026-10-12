@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+build/
+vendor/
+*.pak
+*.sav
+*.zip
+*.bsp
+*.lit
+*.mp4
+progs.dat

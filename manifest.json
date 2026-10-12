@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.slogonomo.live-quake",
+  "name": "Live Quake",
+  "version": "0.2.0",
+  "author": "slogonomo",
+  "description": "FrikBot X bots play Quake deathmatch live on your Omarchy desktop and as your screensaver (Ironwail, OpenGL). Click in to take over, F12 hands back. Single player too. Read the README for requirements and limits.",
+  "license": "0BSD AND CC0-1.0 AND GPL-2.0-or-later AND BSD-3-Clause AND MIT AND HPND-sell-variant AND LicenseRef-FrikBot-X",
+  "kinds": [
+    "overlay"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "menu/Menu.qml"
+  }
+}

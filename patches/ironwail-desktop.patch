@@ -1,0 +1,2670 @@
+--- a/Quake/Makefile
++++ b/Quake/Makefile
+@@ -210,6 +210,22 @@
+ SYSOBJ_NET = net_bsd.o net_udp.o
+ SYSOBJ_SYS = pl_linux.o sys_sdl_unix.o
+ SYSOBJ_MAIN= main_sdl.o
++
++# Scratch shared ABI target: the frontend owns lifecycle and frame pacing.
++ifeq ($(LIVE_QUAKE_SHARED),1)
++SYSOBJ_MAIN = lq_libretro.o live_quake.o
++SYSOBJ_SND = lq_sound.o
++SYSOBJ_GL_VID = gl_vidsdl.o lq_egl_offscreen.o
++override CFLAGS += -fPIC -I../../include
++# Keep bot arithmetic separate from FMA-capable engine compilation.
++live_quake.o: override CFLAGS += -ffp-contract=off
++override DFLAGS += -DLIVE_QUAKE=1 -DLQ_OFFSCREEN
++ifeq ($(LIVE_QUAKE_GPU),1)
++SYSOBJ_GL_VID = gl_vidsdl.o lq_egl_gbm.o gpu_gbm.o gpu_transport.o
++override DFLAGS += -DLQ_GPU
++LIBS += -lgbm
++endif
++endif
+ 
+ GLOBJS = \
+ 	gl_refrag.o \
+@@ -278,6 +294,10 @@
+ 	zone.o \
+ 	$(SYSOBJ_SYS) $(SYSOBJ_MAIN)
+ 
++ifneq (,$(findstring -DLQ_OFFSCREEN,$(DFLAGS)))
++OBJS := $(filter-out steam.o,$(OBJS)) lq_steam_disabled.o
++endif
++
+ OBJDEPS := $(OBJS:%.o=%.d)
+ OBJS += $(SYSOBJ_RES)
+ 
+@@ -302,6 +322,10 @@
+ 	$(LINKER) $(OBJS) $(LDFLAGS) $(LIBS) $(SDL_LIBS) -o $@
+ 	$(call do_strip,$@)
+ 
++ironwail_libretro.so: $(OBJS) $(MAKEFILE)
++	@echo "Linking shared core $@" && \
++	$(LINKER) -shared -Wl,-z,defs $(OBJS) $(LDFLAGS) $(LIBS) $(SDL_LIBS) -lEGL -o $@
++
+ release:	ironwail
+ debug:
+ 	$(error Use "make DEBUG=1")
+--- a/Quake/cl_input.c
++++ b/Quake/cl_input.c
+@@ -385,7 +385,8 @@
+ void CL_SendMove (const usercmd_t *cmd)
+ {
+ 	int		i;
+-	int		bits;
++	int		bits, botbits = -1;
++	usercmd_t botcmd;
+ 	sizebuf_t	buf;
+ 	byte	data[128];
+ 
+@@ -395,6 +396,10 @@
+ 
+ 	if (cmd) 
+ 	{
++		extern void LQ_BotMove(usercmd_t *, int *);
++		botcmd = *cmd;
++		LQ_BotMove(&botcmd, &botbits);
++		cmd = &botcmd;
+ 		cl.cmd = *cmd;
+ 
+ 	//
+@@ -429,6 +434,7 @@
+ 			bits |= 2;
+ 		in_jump.state &= ~2;
+ 
++		if (botbits >= 0) bits = botbits;
+ 		MSG_WriteByte (&buf, bits);
+ 
+ 		MSG_WriteByte (&buf, in_impulse);
+--- a/Quake/common.c
++++ b/Quake/common.c
+@@ -2448,44 +2448,9 @@
+ */
+ static void COM_AddEnginePak (void)
+ {
+-	int			i;
+-	char		pakfile[MAX_OSPATH];
+-	pack_t		*pak = NULL;
+-	qboolean	modified = com_modified;
+-
+-	if (host_parms->exedir)
+-	{
+-		q_snprintf (pakfile, sizeof(pakfile), "%s/" ENGINE_PAK, host_parms->exedir);
+-		pak = COM_LoadPackFile (pakfile);
+-	}
+-
+-	if (!pak)
+-	{
+-		q_snprintf (pakfile, sizeof(pakfile), "%s/" ENGINE_PAK, host_parms->basedir);
+-		pak = COM_LoadPackFile (pakfile);
+-	}
+-
+-	if (!pak)
+-	{
+-		for (i = 0; i < com_numbasedirs; i++)
+-		{
+-			q_snprintf (pakfile, sizeof(pakfile), "%s/" ENGINE_PAK, com_basedirs[i]);
+-			pak = COM_LoadPackFile (pakfile);
+-			if (pak)
+-				break;
+-		}
+-	}
+-
+-	if (pak)
+-	{
+-		searchpath_t *search = (searchpath_t *) Z_Malloc(sizeof(searchpath_t));
+-		search->path_id = com_searchpaths ? com_searchpaths->path_id : 1u;
+-		search->pack = pak;
+-		search->next = com_searchpaths;
+-		com_searchpaths = search;
+-	}
+-
+-	com_modified = modified;
++	/* Live Quake uses only the explicitly selected game archives. The
++	 * bundled engine archive is intentionally never searched or loaded. */
++	return;
+ }
+ 
+ /*
+@@ -2493,6 +2458,18 @@
+ COM_AddGameDirectory -- johnfitz -- modified based on topaz's tutorial
+ =================
+ */
++/* Explicit Live Quake-owned mod archive; never changes the selected save dir. */
++int LQ_AddBotPack(const char *path) {
++    pack_t *pack = COM_LoadPackFile(path);
++    if (!pack) return 0;
++    searchpath_t *search = Z_Malloc(sizeof(*search));
++    search->path_id = com_searchpaths ? com_searchpaths->path_id << 1 : 1;
++    search->pack = pack;
++    search->next = com_searchpaths;
++    com_searchpaths = search;
++    return 1;
++}
++
+ void COM_AddGameDirectory (const char *dir)
+ {
+ 	const char *base;
+--- a/Quake/console.c
++++ b/Quake/console.c
+@@ -2372,6 +2372,10 @@
+ */
+ void Con_NotifyBox (const char *text)
+ {
++#ifdef LQ_OFFSCREEN
++	(void)text;
++	Con_Printf ("Input notification skipped in Live Quake.\n");
++#else
+ 	double		t1, t2;
+ 	int		lastkey, lastchar;
+ 
+@@ -2401,6 +2405,7 @@
+ 	IN_Activate();
+ 	key_dest = key_game;
+ 	realtime = 0;		// put the cursor back to invisible
++#endif
+ }
+ 
+ 
+--- a/Quake/default_cfg.h
++++ b/Quake/default_cfg.h
+@@ -1,93 +1,30 @@
+-// keep in sync with Misc/qs_pak/default.cfg
+-
++// SPDX-License-Identifier: 0BSD
++/* Live Quake fallback authored from ordinary user controls. Game-provided
++ * default.cfg always takes priority. No copied game text or art. */
+ static const char default_cfg[] =
+ "unbindall\n"
+-
+-"bind ALT +strafe\n"
+-
+-"bind , +moveleft\n"
++"bind w +forward\n"
++"bind s +back\n"
+ "bind a +moveleft\n"
+-"bind . +moveright\n"
+ "bind d +moveright\n"
+-"bind DEL +lookdown\n"
+-"bind PGDN +lookup\n"
+-"bind END centerview\n"
+-
+-"bind e +moveup\n"
+-"bind c +movedown\n"
++"bind SPACE +jump\n"
++"bind CTRL +attack\n"
+ "bind SHIFT +speed\n"
+-"bind CTRL +attack\n"
++"bind MOUSE1 +attack\n"
++"bind MOUSE2 +jump\n"
+ "bind UPARROW +forward\n"
+-"bind w +forward\n"
+ "bind DOWNARROW +back\n"
+-"bind s +back\n"
+ "bind LEFTARROW +left\n"
+ "bind RIGHTARROW +right\n"
+-
+-"bind SPACE +jump\n"
+-
+-"bind TAB +showscores\n"
+-
+-"bind 1 \"impulse 1\"\n"
+-"bind 2 \"impulse 2\"\n"
+-"bind 3 \"impulse 3\"\n"
+-"bind 4 \"impulse 4\"\n"
+-"bind 5 \"impulse 5\"\n"
+-"bind 6 \"impulse 6\"\n"
+-"bind 7 \"impulse 7\"\n"
+-"bind 8 \"impulse 8\"\n"
+-
+-"bind 0 \"impulse 0\"\n"
+-
+-"bind / \"impulse 10\"\n"
+-"bind MWHEELDOWN \"impulse 10\"\n"
+-"bind MWHEELUP \"impulse 12\"\n"
+-
+-"alias zoom_in \"togglezoom\"\n"
+-"alias zoom_out \"togglezoom\"\n"
+-"bind F11 zoom_in\n"
+-
+-"bind F1 \"help\"\n"
+-"bind F2 \"menu_save\"\n"
+-"bind F3 \"menu_load\"\n"
+-"bind F4 \"menu_options\"\n"
+-"bind F5 \"menu_multiplayer\"\n"
+-"bind F6 \"echo Quicksaving...; wait; save quick\"\n"
+-"bind F9 \"echo Quickloading...; wait; load quick\"\n"
+-"bind F10 \"quit\"\n"
+-"bind F12 \"screenshot\"\n"
+-
+-"bind PRINTSCREEN \"screenshot\"\n"
+-
+-"bind \\ +mlook\n"
+-
+-"bind PAUSE \"pause\"\n"
+-"bind ESCAPE \"togglemenu\"\n"
+-"bind ~ \"toggleconsole\"\n"
+-"bind ` \"toggleconsole\"\n"
+-
+-"bind t \"messagemode\"\n"
+-
+-"bind + \"sizeup\"\n"
+-"bind = \"sizeup\"\n"
+-"bind - \"sizedown\"\n"
+-
+-"bind INS +klook\n"
+-
+-"bind MOUSE1 +attack\n"
+-"bind MOUSE2 +jump\n"
+-
+-"bind LSHOULDER \"impulse 12\"\n"
+-"bind RSHOULDER \"impulse 10\"\n"
+-"bind LTRIGGER +jump\n"
+-"bind RTRIGGER +attack\n"
+-
+-"gamma 0.95\n"
+-"contrast 1.2\n"
++"bind ESCAPE togglemenu\n"
++"bind ` toggleconsole\n"
++"bind ~ toggleconsole\n"
++"bind - sizedown\n"
++"bind = sizeup\n"
++"sensitivity 3\n"
+ "volume 0.7\n"
+-"sensitivity 3\n"
+-
+-"viewsize 110\n"
+-"scr_autoscale\n"
+-
++"gamma 0.7\n"
++"viewsize 120\n"
++"cl_startdemos 0\n"
++"sv_autosave 0\n"
+ "+mlook\n";
+--- a/Quake/gl_screen.c
++++ b/Quake/gl_screen.c
+@@ -24,6 +24,9 @@
+ // screen.c -- master for refresh, status bar, console, chat, notify, etc
+ 
+ #include "quakedef.h"
++#ifdef LQ_GPU
++#include "lq_egl_offscreen.h"
++#endif
+ #include "steam.h"
+ #include <time.h>
+ 
+@@ -286,29 +289,77 @@
+ 	}
+ }
+ 
++/* Count display glyphs without reading beyond the current message. */
++static int SCR_CenterPrintGlyphCount (void)
++{
++	int i, glyphs = 0;
++
++	for (i = 0; i < (int) sizeof (scr_centerstring); i++)
++	{
++		if (!scr_centerstring[i])
++			return glyphs;
++		if (scr_centerstring[i] != '\n')
++			glyphs++;
++	}
++	return -1;
++}
++
++/* The existing printer draws one glyph before consuming its time budget. */
++static int SCR_CenterPrintRevealCount (int glyphs)
++{
++	double elapsed = cl.time - scr_centertime_start;
++	double budget;
++
++	if (glyphs <= 0 || !isfinite (elapsed) || elapsed < 0 || !isfinite (scr_printspeed.value))
++		return 0;
++	budget = scr_printspeed.value * elapsed;
++	if (!isfinite (budget))
++		return 0;
++	if (budget <= -1 || budget >= glyphs - 1)
++		return glyphs;
++	return (int) budget + 1;
++}
++
++qboolean SCR_FinaleFinished (void)
++{
++	int glyphs;
++
++	if (cls.state != ca_connected || cl.intermission != 2)
++		return false;
++	glyphs = SCR_CenterPrintGlyphCount ();
++	return glyphs > 0 && SCR_CenterPrintRevealCount (glyphs) == glyphs;
++}
++
+ void SCR_DrawCenterString (void) //actually do the drawing
+ {
+ 	char	*start;
+ 	int		l;
+ 	int		j;
+ 	int		x, y;
+-	int		remaining;
++	int		remaining, glyphs;
+ 	float	alpha, forcedalpha;
++
++	glyphs = SCR_CenterPrintGlyphCount ();
++	if (glyphs <= 0)
++		return;
+ 
+ 	GL_SetCanvas (CANVAS_MENU); //johnfitz
+ 
+ // the finale prints the characters one at a time
+ 	if (cl.intermission)
+ 	{
+-		remaining = scr_printspeed.value * (cl.time - scr_centertime_start);
++		remaining = SCR_CenterPrintRevealCount (glyphs);
+ 		alpha = 1.f;
+ 	}
+ 	else
+ 	{
+ 		float fade = q_max (con_notifyfade.value * con_notifyfadetime.value, 0.f);
+-		remaining = 9999;
++		remaining = glyphs;
+ 		alpha = fade ? q_min (scr_centertime_off / fade, 1.f) : 1.f;
+ 	}
++
++	if (remaining <= 0)
++		return;
+ 
+ 	if (M_ForcedCenterPrint (&forcedalpha))
+ 		alpha *= forcedalpha * forcedalpha;
+@@ -337,8 +388,8 @@
+ 		for (j=0 ; j<l ; j++, x+=8)
+ 		{
+ 			Draw_Character (x, y, start[j]);	//johnfitz -- stretch overlays
+-			if (!remaining--)
+-				return;
++			if (!--remaining)
++				goto done;
+ 		}
+ 
+ 		y += 8;
+@@ -349,6 +400,7 @@
+ 		start++;		// skip the \n
+ 	} while (1);
+ 
++done:
+ 	GL_PopCanvasColor ();
+ }
+ 
+@@ -2009,6 +2061,12 @@
+ */
+ int SCR_ModalMessage (const char *text, float timeout) //johnfitz -- timeout
+ {
++#ifdef LQ_OFFSCREEN
++	(void)text;
++	(void)timeout;
++	Con_Printf ("Confirmation unavailable in Live Quake; action cancelled.\n");
++	return false;
++#else
+ 	double time1, time2; //johnfitz -- timeout
+ 	int lastkey, lastchar;
+ 
+@@ -2052,6 +2110,7 @@
+ 	//johnfitz
+ 
+ 	return (lastchar == 'y' || lastchar == 'Y' || lastkey == K_ABUTTON);
++#endif
+ }
+ 
+ 
+@@ -2129,6 +2188,19 @@
+ 
+ 	if (!scr_initialized || !con_initialized)
+ 		return;				// not initialized yet
++
++#ifdef LQ_GPU
++	if (!LQ_EGL_Ready())
++	{
++		/* Presentation can wait; CPU view and listener state cannot. */
++		glwidth = vid.width;
++		glheight = vid.height;
++		SCR_SetUpToDrawConsole ();
++		V_UpdateBlend ();
++		V_PrepareView ();
++		return;
++	}
++#endif
+ 
+ 
+ 	GL_BeginRendering (&glx, &gly, &glwidth, &glheight);
+--- a/Quake/view.c
++++ b/Quake/view.c
+@@ -917,7 +917,7 @@
+ */
+ extern vrect_t	scr_vrect;
+ 
+-void V_RenderView (void)
++void V_PrepareView (void)
+ {
+ 	if (con_forcedup)
+ 		return;
+@@ -926,6 +926,20 @@
+ 		V_CalcIntermissionRefdef ();
+ 	else if (!cl.paused /* && (cl.maxclients > 1 || key_dest == key_game) */)
+ 		V_CalcRefdef ();
++
++#ifdef LQ_GPU
++	/* Host_Frame also consumes these vectors when drawing is skipped. */
++	VectorCopy (r_refdef.vieworg, r_origin);
++	AngleVectors (r_refdef.viewangles, vpn, vright, vup);
++#endif
++}
++
++void V_RenderView (void)
++{
++	if (con_forcedup)
++		return;
++
++	V_PrepareView ();
+ 
+ 	//johnfitz -- removed lcd code
+ 
+--- a/Quake/view.h
++++ b/Quake/view.h
+@@ -29,6 +29,7 @@
+ extern float v_blend[4];
+ 
+ void V_Init (void);
++void V_PrepareView (void);
+ void V_RenderView (void);
+ void V_CalcBlend (void);
+ void V_UpdateBlend (void);
+--- a/Quake/gl_vidsdl.c
++++ b/Quake/gl_vidsdl.c
+@@ -26,6 +26,9 @@
+ #include "cfgfile.h"
+ #include "bgmusic.h"
+ #include "resource.h"
++#ifdef LQ_OFFSCREEN
++#include "lq_egl_offscreen.h"
++#endif
+ #if defined(SDL_FRAMEWORK) || defined(NO_SDL_CONFIG)
+ #include <SDL2/SDL.h>
+ #else
+@@ -258,6 +261,9 @@
+ */
+ static int VID_GetCurrentWidth (void)
+ {
++#ifdef LQ_OFFSCREEN
++	return lq_offscreen_width;
++#endif
+ 	int w = 0, h = 0;
+ 	SDL_GetWindowSize(draw_context, &w, &h);
+ 	return w;
+@@ -270,6 +276,9 @@
+ */
+ static int VID_GetCurrentHeight (void)
+ {
++#ifdef LQ_OFFSCREEN
++	return lq_offscreen_height;
++#endif
+ 	int w = 0, h = 0;
+ 	SDL_GetWindowSize(draw_context, &w, &h);
+ 	return h;
+@@ -282,6 +291,9 @@
+ */
+ static int VID_GetCurrentRefreshRate (void)
+ {
++#ifdef LQ_OFFSCREEN
++	return DEFAULT_REFRESHRATE;
++#endif
+ 	SDL_DisplayMode mode;
+ 	int current_display;
+ 
+@@ -301,6 +313,9 @@
+ */
+ static int VID_GetCurrentBPP (void)
+ {
++#ifdef LQ_OFFSCREEN
++	return 32;
++#endif
+ 	const Uint32 pixelFormat = SDL_GetWindowPixelFormat(draw_context);
+ 	return SDL_BITSPERPIXEL(pixelFormat);
+ }
+@@ -314,6 +329,9 @@
+ */
+ static qboolean VID_GetFullscreen (void)
+ {
++#ifdef LQ_OFFSCREEN
++	return false;
++#endif
+ 	return (SDL_GetWindowFlags(draw_context) & SDL_WINDOW_FULLSCREEN) != 0;
+ }
+ 
+@@ -326,6 +344,9 @@
+ */
+ static qboolean VID_GetDesktopFullscreen (void)
+ {
++#ifdef LQ_OFFSCREEN
++	return false;
++#endif
+ 	return (SDL_GetWindowFlags(draw_context) & SDL_WINDOW_FULLSCREEN_DESKTOP) == SDL_WINDOW_FULLSCREEN_DESKTOP;
+ }
+ 
+@@ -348,6 +369,9 @@
+ */
+ void VID_SetWindowTitle (const char *title)
+ {
++#ifdef LQ_OFFSCREEN
++	(void)title;return;
++#endif
+ 	SDL_SetWindowTitle (draw_context, title);
+ }
+ 
+@@ -358,6 +382,9 @@
+ */
+ qboolean VID_HasMouseOrInputFocus (void)
+ {
++#ifdef LQ_OFFSCREEN
++	return true;
++#endif
+ 	return (SDL_GetWindowFlags(draw_context) & (SDL_WINDOW_MOUSE_FOCUS | SDL_WINDOW_INPUT_FOCUS)) != 0;
+ }
+ 
+@@ -368,6 +395,9 @@
+ */
+ qboolean VID_IsMinimized (void)
+ {
++#ifdef LQ_OFFSCREEN
++	return false;
++#endif
+ 	return !(SDL_GetWindowFlags(draw_context) & SDL_WINDOW_SHOWN);
+ }
+ 
+@@ -434,6 +464,18 @@
+ */
+ static qboolean VID_SetMode (int width, int height, int refreshrate, qboolean fullscreen)
+ {
++#ifdef LQ_OFFSCREEN
++	(void)refreshrate;(void)fullscreen;
++	LQ_EGL_Create(width,height);
++	vid.width=width;vid.height=height;vid.maxscale=q_max(4,height/240);
++	vid.refreshrate=DEFAULT_REFRESHRATE;
++	vid.conwidth=width&0xFFFFFFF8;vid.conheight=vid.conwidth*height/width;
++	vid.numpages=2;gl_stencilbits=8;modestate=MS_WINDOWED;
++	VID_RecalcInterfaceSize();
++	vid.recalc_refdef=true;vid_changed=false;
++	Con_SafePrintf("Private EGL video mode: %d x %d\n",width,height);
++	return true;
++#endif
+ 	int		temp;
+ 	Uint32	flags;
+ 	char		caption[50];
+@@ -602,6 +644,9 @@
+ */
+ static void VID_ApplyVSync (void)
+ {
++#ifdef LQ_OFFSCREEN
++	return;
++#endif
+ 	const int MAX_INTERVAL = 4;
+ 	int interval = (int) vid_vsync.value;
+ 	if (abs(interval) > MAX_INTERVAL)
+@@ -708,6 +753,12 @@
+ */
+ static void VID_Restart (void)
+ {
++#ifdef LQ_OFFSCREEN
++	/* The frontend owns render geometry and the EGL/GBM pool. */
++	VID_SyncCvars ();
++	Con_Printf ("Offscreen video mode is fixed at %d x %d\n", vid.width, vid.height);
++	return;
++#endif
+ 	int width, height, refreshrate;
+ 	qboolean fullscreen;
+ 
+@@ -760,6 +811,12 @@
+ */
+ static void VID_Test (void)
+ {
++#ifdef LQ_OFFSCREEN
++	/* The frontend owns render geometry and the EGL/GBM pool. */
++	VID_SyncCvars ();
++	Con_Printf ("Offscreen video mode is fixed at %d x %d\n", vid.width, vid.height);
++	return;
++#endif
+ 	int old_width, old_height, old_refreshrate, old_fullscreen;
+ 
+ 	if (vid_locked || !vid_changed)
+@@ -989,7 +1046,13 @@
+ 
+ 	while (funcs->name)
+ 	{
+-		if ((*funcs->ptr = SDL_GL_GetProcAddress (funcs->name)) == NULL)
++		if ((*funcs->ptr =
++#ifdef LQ_OFFSCREEN
++			LQ_EGL_GetProcAddress(funcs->name)
++#else
++			SDL_GL_GetProcAddress(funcs->name)
++#endif
++			) == NULL)
+ 		{
+ 			if (required)
+ 			{
+@@ -1380,7 +1443,11 @@
+ 
+ 	if (!scr_skipupdate)
+ 	{
++#ifdef LQ_OFFSCREEN
++		LQ_EGL_EndFrame();
++#else
+ 		SDL_GL_SwapWindow(draw_context);
++#endif
+ 	}
+ }
+ 
+@@ -1389,6 +1456,9 @@
+ {
+ 	if (vid_initialized)
+ 	{
++#ifdef LQ_OFFSCREEN
++		LQ_EGL_Shutdown();vid_initialized=false;return;
++#endif
+ 		VID_FreeMouseCursors();
+ 		SDL_GL_DeleteContext(gl_context);
+ 		gl_context = NULL;
+@@ -1630,6 +1700,10 @@
+ 	Cmd_AddCommand ("vid_describecurrentmode", VID_DescribeCurrentMode_f);
+ 	Cmd_AddCommand ("vid_describemodes", VID_DescribeModes_f);
+ 
++#ifdef LQ_OFFSCREEN
++	(void)vid_center;
++	display_width=640;display_height=480;display_refreshrate=DEFAULT_REFRESHRATE;
++#else
+ 	putenv (vid_center);	/* SDL_putenv is problematic in versions <= 1.2.9 */
+ 
+ 	if (SDL_InitSubSystem(SDL_INIT_VIDEO) < 0)
+@@ -1644,6 +1718,7 @@
+ 		display_height = mode.h;
+ 		display_refreshrate = mode.refresh_rate;
+ 	}
++#endif
+ 
+ 	Cvar_SetValueQuick (&vid_width, (float)display_width);
+ 	Cvar_SetValueQuick (&vid_height, (float)display_height);
+@@ -1656,8 +1731,10 @@
+ 	}
+ 	CFG_ReadCvarOverrides(read_vars, num_readvars);
+ 
++#ifndef LQ_OFFSCREEN
+ 	VID_InitModelist();
+ 	VID_InitMouseCursors();
++#endif
+ 
+ 	width = (int)vid_width.value;
+ 	height = (int)vid_height.value;
+@@ -1730,7 +1807,9 @@
+ 	VID_SetMode (width, height, refreshrate, fullscreen);
+ 	VID_ApplyVSync ();
+ 
++#ifndef LQ_OFFSCREEN
+ 	PL_SetWindowIcon();
++#endif
+ 
+ 	GL_Init ();
+ 	GL_SetupState ();
+@@ -1803,6 +1882,17 @@
+ */
+ void VID_SyncCvars (void)
+ {
++#ifdef LQ_OFFSCREEN
++	/* There is no SDL window to query in the private renderer. */
++	Cvar_SetValueQuick (&vid_width, vid.width);
++	Cvar_SetValueQuick (&vid_height, vid.height);
++	Cvar_SetValueQuick (&vid_refreshrate, vid.refreshrate);
++	Cvar_SetQuick (&vid_fullscreen, "0");
++	Cvar_SetQuick (&vid_desktopfullscreen, "0");
++	Cvar_SetQuick (&vid_borderless, "0");
++	vid_changed = false;
++	return;
++#endif
+ 	if (draw_context)
+ 	{
+ 		if (!VID_GetDesktopFullscreen())
+--- a/Quake/menu.c
++++ b/Quake/menu.c
+@@ -1348,9 +1348,11 @@
+ 		switch (m_singleplayer_cursor)
+ 		{
+ 		case 0:
++#ifndef LQ_OFFSCREEN
+ 			if (sv.active)
+ 				if (!SCR_ModalMessage("Are you sure you want to\nstart a new game? (y/n)\n", 0.0f))
+ 					break;
++#endif /* New Game is an explicit action; offscreen input cannot service a modal. */
+ 			if (quake64)
+ 			{
+ 				M_SetSkillMenuMap ("start");
+@@ -1361,9 +1363,15 @@
+ 			key_dest = key_game;
+ 			if (sv.active)
+ 				Cbuf_AddText ("disconnect\n");
+-			Cbuf_AddText ("maxplayers 1\n");
+-			Cbuf_AddText ("deathmatch 0\n"); //johnfitz
+-			Cbuf_AddText ("coop 0\n"); //johnfitz
++			{
++				extern int LQ_LocalFrikSession(void), LQ_SessionMode(void);
++				extern void LQ_NewDeathmatchGame(void);
++				if (LQ_SessionMode()) { LQ_NewDeathmatchGame(); break; }
++				int local_frik = LQ_LocalFrikSession();
++				Cbuf_AddText (local_frik ? "maxplayers 8\n" : "maxplayers 1\n");
++				Cbuf_AddText ("deathmatch 0\n");
++				Cbuf_AddText (local_frik ? "coop 1\n" : "coop 0\n");
++			}
+ 			Cbuf_AddText ("campaign 1\n");
+ 			Cbuf_AddText ("map start\n");
+ 			break;
+@@ -1438,2 +1446,4 @@
+ void M_Menu_Load_f (void)
+ {
++	extern int LQ_SessionMode(void);
++	if (LQ_SessionMode()) return;
+@@ -1448,11 +1458,13 @@
+ 
+ void M_Menu_Save_f (void)
+ {
++	extern int LQ_LocalFrikSession(void), LQ_SessionMode(void);
++	if (LQ_SessionMode()) return;
+ 	if (!sv.active)
+ 		return;
+ 	if (cl.intermission)
+ 		return;
+-	if (svs.maxclients != 1)
++	if (svs.maxclients != 1 && !LQ_LocalFrikSession())
+ 		return;
+ 	m_entersound = true;
+ 	m_state = m_save;
+@@ -1498,2 +1510,4 @@
+ void M_Load_Key (int k)
+ {
++	extern int LQ_SessionMode(void);
++	if (LQ_SessionMode()) return;
+@@ -1541,6 +1555,8 @@
+ 
+ void M_Save_Key (int k)
+ {
++	extern int LQ_LocalFrikSession(void), LQ_SessionMode(void);
++	if (LQ_SessionMode() || !sv.active || cl.intermission || (svs.maxclients != 1 && !LQ_LocalFrikSession())) return;
+ 	switch (k)
+ 	{
+ 	case K_ESCAPE:
+@@ -2153,9 +2169,15 @@
+ 		{
+ 			// Fresh start
+ 			Cbuf_AddText (va ("skill %d\n", m_skill_cursor));
+-			Cbuf_AddText ("maxplayers 1\n");
+-			Cbuf_AddText ("deathmatch 0\n"); //johnfitz
+-			Cbuf_AddText ("coop 0\n"); //johnfitz
++			{
++				extern int LQ_LocalFrikSession(void), LQ_SessionMode(void);
++				extern void LQ_NewDeathmatchGame(void);
++				if (LQ_SessionMode()) { LQ_NewDeathmatchGame(); break; }
++				int local_frik = LQ_LocalFrikSession();
++				Cbuf_AddText (local_frik ? "maxplayers 8\n" : "maxplayers 1\n");
++				Cbuf_AddText ("deathmatch 0\n");
++				Cbuf_AddText (local_frik ? "coop 1\n" : "coop 0\n");
++			}
+ 			Cbuf_AddText ("campaign 0\n");
+ 			Cbuf_AddText (va ("map \"%s\"\n", m_skill_mapname));
+ 		}
+@@ -3080,13 +3102,21 @@
+ #define TITLE_BAR			"\35\36\37"
+ #define TITLE(str)			TITLE_BAR " " str " " TITLE_BAR
+ 
++#ifdef LQ_OFFSCREEN
++/* All Display controls are frontend-owned or inert in this build.
++ * An empty link preserves option IDs and existing spacer navigation. */
++#define LQ_VIDEO_MENU_LABEL ""
++#else
++#define LQ_VIDEO_MENU_LABEL "Display"
++#endif
++
+ ////////////////////////////////////////////////////////////////////////
+ #define OPTIONS_LIST(begin_menu, item, end_menu)						\
+ 	begin_menu (OPTIONS, m_options, "")									\
+ 		item (OPT_PREVIEW,				"Live Preview")					\
+ 		item (OPT_GAMMA,				"Brightness")					\
+ 		item (OPT_CONTRAST,				"Contrast")						\
+-		item (OPT_VIDEO,				"Display")						\
++		item (OPT_VIDEO,				LQ_VIDEO_MENU_LABEL)						\
+ 		item (OPT_GRAPHICS,				"Graphics")						\
+ 		item (OPT_INTERFACE,			"Interface")					\
+ 		item (SPACER,					"")								\
+@@ -3496,6 +3526,11 @@
+ 
+ void M_Options_Init (enum m_state_e state)
+ {
++#ifdef LQ_OFFSCREEN
++	/* Direct menu_video requests still open useful render controls. */
++	if (state == m_video)
++		state = m_graphics;
++#endif
+ 	int submenu = M_Options_FindSubmenu (state);
+ 
+ 	IN_DeactivateForMenu();
+@@ -3515,6 +3550,12 @@
+ 
+ 	optionsmenu.first_item = options_submenus[submenu].first_item;
+ 	optionsmenu.list.numitems = options_submenus[submenu].num_items;
++#ifdef LQ_OFFSCREEN
++	/* Reset All is the final Options row. Preserve option IDs, but exclude
++	 * that unsupported action from drawing, navigation and search. */
++	if (state == m_options)
++		optionsmenu.list.numitems--;
++#endif
+ 	optionsmenu.last_cursor = &optionsmenu.submenu_cursors[submenu];
+ 	optionsmenu.subtitle = options_submenus[submenu].description;
+ 
+--- a/Quake/host_cmd.c
++++ b/Quake/host_cmd.c
+@@ -25,6 +25,15 @@
+ #include "q_ctype.h"
+ #include "json.h"
+ #include <time.h>
++#ifdef LIVE_QUAKE
++#include "lq_session.h"
++#include "lq_libretro.h"
++#include <errno.h>
++#include <float.h>
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#endif
+ #ifndef WITHOUT_CURL
+ #include <curl/curl.h>
+ #endif
+@@ -50,10 +59,16 @@
+ 		M_Menu_Quit_f ();
+ 		return;
+ 	}
++#ifdef LIVE_QUAKE
++	{
++		extern void LQ_RequestQuit (void);
++		LQ_RequestQuit ();
++	}
++#else
+ 	CL_Disconnect ();
+ 	Host_ShutdownServer(false);
+-
+ 	Sys_Quit ();
++#endif
+ }
+ 
+ //==============================================================================
+@@ -2210,6 +2225,224 @@
+ static SDL_cond			*save_finished_condition;
+ static SDL_cond			*save_pending_condition;
+ 
++#ifdef LIVE_QUAKE
++static SDL_atomic_t lq_save_result;
++static int lq_load_result;
++
++int retro_lq_save_succeeded (void)
++{
++	if (save_mutex)
++		Host_WaitForSaveThread ();
++	return SDL_AtomicGet (&lq_save_result);
++}
++
++int retro_lq_load_succeeded (void) { return lq_load_result; }
++
++/* A terminal marker proves framing, not a checksum of the world contents. */
++static int LQ_SaveFooter (char *text, size_t bytes, int *count, const char **body_end)
++{
++	return LQ_SessionSaveFooter (text, bytes, svs.maxclients, LQ_SessionMode (),
++		MAX_EDICTS, count, body_end);
++}
++
++static char *LQ_ReadCheckpoint (const char *path, int *count, const char **body_end)
++{
++	struct stat before, after;
++	char *text = NULL;
++	FILE *file;
++	int fd, ok;
++	fd = open (path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
++	if (fd < 0)
++		return NULL;
++	if (fstat (fd, &before) || !S_ISREG (before.st_mode) || before.st_uid != getuid () ||
++		before.st_size < 100 || before.st_size >= LQ_SAVE_MAX_BYTES)
++	{
++		close (fd);
++		return NULL;
++	}
++	file = fdopen (fd, "rb");
++	if (!file)
++	{
++		close (fd);
++		return NULL;
++	}
++	text = (char *)malloc ((size_t)before.st_size + 1);
++	ok = text && fread (text, 1, (size_t)before.st_size, file) == (size_t)before.st_size &&
++		fgetc (file) == EOF && !ferror (file) && !fstat (fd, &after) &&
++		before.st_dev == after.st_dev && before.st_ino == after.st_ino &&
++		before.st_size == after.st_size;
++	if (fclose (file) != 0)
++		ok = 0;
++	if (ok)
++	{
++		text[before.st_size] = 0;
++		ok = LQ_SaveFooter (text, (size_t)before.st_size, count, body_end);
++	}
++	if (!ok)
++	{
++		free (text);
++		return NULL;
++	}
++	return text;
++}
++
++/* Refuse aliases and foreign files before truncating an owned checkpoint.
++ * Walk parents by descriptor so even a symlinked gamedir cannot escape the
++ * frontend's private profile. Same-uid concurrent mutation is not prevented. */
++static FILE *LQ_OpenCheckpoint (const char *path)
++{
++	const char *part, *slash;
++	char component[256];
++	struct stat st;
++	FILE *file = NULL;
++	int parent, next, fd = -1;
++	size_t length;
++	if (!path || path[0] != '/' || !path[1] || strlen (path) >= MAX_OSPATH || strchr (path, '\\'))
++		return NULL;
++	for (part = path; *part; ++part)
++		if ((unsigned char)*part < 32 || (unsigned char)*part == 127)
++			return NULL;
++	parent = open ("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
++	if (parent < 0)
++		return NULL;
++	for (part = path + 1;; part = slash + 1)
++	{
++		slash = strchr (part, '/');
++		length = slash ? (size_t)(slash - part) : strlen (part);
++		if (!length || length >= sizeof (component) ||
++			(length == 1 && part[0] == '.') ||
++			(length == 2 && part[0] == '.' && part[1] == '.'))
++			goto done;
++		memcpy (component, part, length);
++		component[length] = 0;
++		if (!slash)
++			break;
++		next = openat (parent, component, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
++		if (next < 0)
++			goto done;
++		close (parent);
++		parent = next;
++	}
++	if (fstat (parent, &st) || !S_ISDIR (st.st_mode) || st.st_uid != getuid () ||
++		(st.st_mode & 0777) != 0700)
++		goto done;
++	fd = openat (parent, component, O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0600);
++	if (fd < 0 || fstat (fd, &st) || !S_ISREG (st.st_mode) || st.st_uid != getuid () ||
++		(st.st_mode & 0777) != 0600 || st.st_nlink != 1)
++		goto done;
++	file = fdopen (fd, "w");
++	if (!file)
++		goto done;
++	fd = -1; // file now owns the descriptor
++	if (ftruncate (fileno (file), 0))
++	{
++		fclose (file);
++		file = NULL;
++	}
++done:
++	if (fd >= 0)
++		close (fd);
++	close (parent);
++	return file;
++}
++
++static int LQ_SaveLine (const char **data, const char *end, const char **line, size_t *length)
++{
++	const char *newline;
++	if (*data >= end || !(newline = (const char *)memchr (*data, '\n', (size_t)(end - *data))) ||
++		(size_t)(newline - *data) >= 1024)
++		return 0;
++	*line = *data;
++	*length = (size_t)(newline - *data);
++	*data = newline + 1;
++	return 1;
++}
++
++static int LQ_SaveNumber (const char **data, const char *end, double *value)
++{
++	const char *line;
++	char *tail;
++	size_t length;
++	if (!LQ_SaveLine (data, end, &line, &length))
++		return 0;
++	errno = 0;
++	*value = strtod (line, &tail);
++	if (tail == line || errno == ERANGE || !isfinite (*value))
++		return 0;
++	while (tail < line + length && (*tail == ' ' || *tail == '\t' || *tail == '\r'))
++		++tail;
++	return tail == line + length;
++}
++
++static int LQ_SaveHeader (const char *start, const char *end, float *spawn_parms,
++	int *skill, char *mapname, size_t mapsize, double *time,
++	const char **styles, const char **body)
++{
++	const char *data = start, *line;
++	size_t length;
++	double value;
++	int i;
++	if (!LQ_SaveNumber (&data, end, &value) || value != SAVEGAME_VERSION ||
++		!LQ_SaveLine (&data, end, &line, &length))
++		return 0;
++	for (i = 0; i < NUM_SPAWN_PARMS; ++i)
++	{
++		if (!LQ_SaveNumber (&data, end, &value) || value < -FLT_MAX || value > FLT_MAX)
++			return 0;
++		spawn_parms[i] = (float)value;
++	}
++	if (!LQ_SaveNumber (&data, end, &value) || value < 0 || value > 3)
++		return 0;
++	*skill = (int)(value + 0.1); // retain ordinary Quake 1.06 skill compatibility
++	if (!LQ_SaveLine (&data, end, &line, &length) || !length || length >= mapsize ||
++		strspn (line, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") != length)
++		return 0;
++	memcpy (mapname, line, length);
++	mapname[length] = 0;
++	if (!LQ_SaveNumber (&data, end, time) || *time < 0)
++		return 0;
++	*styles = data;
++	for (i = 0; i < MAX_LIGHTSTYLES; ++i)
++		if (!LQ_SaveLine (&data, end, &line, &length))
++			return 0;
++	*body = data;
++	return 1;
++}
++
++static int LQ_SaveTrailingSpace (const char *data, const char *end)
++{
++	if (!data || data > end)
++		return 0;
++	for (; data < end; ++data)
++		if (*data != ' ' && *data != '\t' && *data != '\r' && *data != '\n')
++			return 0;
++	return 1;
++}
++
++static int LQ_SaveBody (const char *data, const char *end, int count)
++{
++	int i;
++	for (i = -1; i < count; ++i) // globals followed by precisely count entities
++	{
++		data = COM_Parse (data);
++		if (!data || strcmp (com_token, "{"))
++			return 0;
++		for (;;)
++		{
++			data = COM_Parse (data);
++			if (!data)
++				return 0;
++			if (!strcmp (com_token, "}"))
++				break;
++			data = COM_Parse (data);
++			if (!data || !strcmp (com_token, "}"))
++				return 0;
++		}
++	}
++	return LQ_SaveTrailingSpace (data, end);
++}
++#endif
++
+ /*
+ ===============
+ Host_SavegameComment
+@@ -2247,7 +2480,7 @@
+ // convert space to _ to make stdio happy
+ 	for (i = 0; i < SAVEGAME_COMMENT_LENGTH; i++)
+ 	{
+-		if (text[i] == ' ')
++		if ((unsigned char)text[i] <= ' ' || (unsigned char)text[i] == 127)
+ 			text[i] = '_';
+ 	}
+ }
+@@ -2281,6 +2514,11 @@
+ 	save_pending_condition = NULL;
+ 
+ 	SaveData_Clear (&save_data);
++#ifdef LIVE_QUAKE
++	SDL_AtomicSet (&lq_save_result, 0);
++	lq_load_result = 0;
++	save_pending = false;
++#endif
+ }
+ 
+ void Host_WaitForSaveThread (void)
+@@ -2320,6 +2558,9 @@
+ 		edict_t		*ed;
+ 		int			i;
+ 		qboolean	abort = false;
++#ifdef LIVE_QUAKE
++		int write_ok = 1;
++#endif
+ 
+ 		SDL_LockMutex (save_mutex);
+ 		while (!save_pending)
+@@ -2331,6 +2572,10 @@
+ 
+ 		PR_SwitchQCVM (&sv.qcvm);
+ 		SaveData_WriteHeader (save);
++#ifdef LIVE_QUAKE
++		if (ferror (save->file))
++			write_ok = 0;
++#endif
+ 		for (i = 0, ed = save->edicts; i < save->num_edicts; i++, ed = NEXT_EDICT (ed))
+ 		{
+ 			if (SDL_AtomicGet(&save->abort))
+@@ -2339,18 +2584,55 @@
+ 				break;
+ 			}
+ 			ED_Write (save, ed);
++#ifdef LIVE_QUAKE
++			if (fflush (save->file) != 0 || ferror (save->file))
++				write_ok = 0;
++#else
+ 			fflush (save->file);
+-		}
++#endif
++		}
++#ifdef LIVE_QUAKE
++		if (SDL_AtomicGet (&save->abort) || ferror (save->file))
++			write_ok = 0;
++		if (!abort && write_ok)
++		{
++			char footer[64];
++			int length = q_snprintf (footer, sizeof (footer), LQ_SAVE_FOOTER "%d %s %d\n", svs.maxclients,
++				LQ_SessionMode () ? "deathmatch" : "single", save->num_edicts);
++			if (length < 0 || length >= (int)sizeof (footer) ||
++				fprintf (save->file, "%s", footer) != length)
++				write_ok = 0;
++		}
++		if (fflush (save->file) != 0 || ferror (save->file) ||
++			Sys_ftell (save->file) <= 0 || Sys_ftell (save->file) >= LQ_SAVE_MAX_BYTES)
++			write_ok = 0;
++#else
+ 		if (!abort)
+ 			fprintf (save->file, "// %d edicts\n", save->num_edicts);
++#endif
+ 		PR_SwitchQCVM (NULL);
+ 
++#ifdef LIVE_QUAKE
++		if (fclose (save->file) != 0)
++			write_ok = 0;
++#else
+ 		fclose (save->file);
++#endif
+ 		save->file = NULL;
++#ifdef LIVE_QUAKE
++		if (!write_ok)
++		{
++			abort = true;
++			SDL_AtomicCAS (&save->abort, 0, -1);
++		}
++#endif
+ 		if (abort)
+ 			Sys_remove (save->path);
+ 
+ 		SDL_LockMutex (save_mutex);
++#ifdef LIVE_QUAKE
++		SDL_AtomicSet (&lq_save_result, !abort && write_ok);
++#endif
+ 		save_pending = false;
+ 		SDL_CondSignal (save_finished_condition);
+ 		SDL_UnlockMutex (save_mutex);
+@@ -2381,6 +2663,13 @@
+ 	FILE		*f;
+ 	int			i;
+ 
++#ifdef LIVE_QUAKE
++	/* Serialize older completion before resetting this attempt's receipt. */
++	if (save_mutex)
++		Host_WaitForSaveThread ();
++	SDL_AtomicSet (&lq_save_result, 0);
++#endif
++
+ 	if (cmd_source != src_command)
+ 		return;
+ 
+@@ -2402,7 +2691,8 @@
+ 		return;
+ 	}
+ 
+-	if (svs.maxclients != 1)
++	extern int LQ_LocalFrikSession(void);
++	if (LQ_SessionMode () || (svs.maxclients != 1 && !LQ_LocalFrikSession()))
+ 	{
+ 		Con_Printf ("Can't save multiplayer games.\n");
+ 		return;
+@@ -2431,7 +2721,11 @@
+ 
+ 	q_strlcpy (relname, Cmd_Argv(1), sizeof(relname));
+ 	COM_AddExtension (relname, ".sav", sizeof(relname));
+-	q_snprintf (name, sizeof(name), "%s/%s", com_gamedir, relname);
++	if ((size_t)q_snprintf (name, sizeof(name), "%s/%s", com_gamedir, relname) >= sizeof (name))
++	{
++		Con_Printf ("ERROR: save path is too long.\n");
++		return;
++	}
+ 
+ 	// second argument, if present, indicates whether or not text should be printed to the notification area
+ 	skipnotify = (Cmd_Argc () < 3 || atof (Cmd_Argv (2))) ? "" : "[skipnotify]";
+@@ -2448,7 +2742,11 @@
+ 		SDL_UnlockMutex (save_mutex);
+ 	}
+ 
++#ifdef LIVE_QUAKE
++	f = LQ_OpenCheckpoint (name);
++#else
+ 	f = Sys_fopen (name, "w");
++#endif
+ 	if (!f)
+ 	{
+ 		Con_Printf ("ERROR: couldn't open.\n");
+@@ -2488,14 +2786,32 @@
+ 	char	name[MAX_OSPATH];
+ 	char	relname[MAX_OSPATH];
+ 	char	mapname[MAX_QPATH];
+-	float	time, tfloat;
++	double	time;
++#ifndef LIVE_QUAKE
++	float	tfloat, legacy_time;
++#endif
+ 	const char	*data;
+ 	int	i;
+ 	edict_t	*ent;
+ 	int	entnum;
++#ifndef LIVE_QUAKE
+ 	int	version;
++#endif
+ 	float	spawn_parms[NUM_SPAWN_PARMS];
++#ifdef LIVE_QUAKE
++	const char *body_end = NULL, *styles = NULL, *body = NULL;
++	int declared_edicts = 0, saved_skill = 0;
++	lq_load_result = 0;
++	if (LQ_SessionMode ())
++	{
++		Con_Printf ("Loading is unavailable in deathmatch.\n");
++		return;
++	}
++	if (save_mutex)
++		Host_WaitForSaveThread ();
++#else
+ 	qboolean kexonly = false;
++#endif
+ 
+ 	if (cmd_source != src_command)
+ 		return;
+@@ -2513,8 +2829,10 @@
+ 	}
+ 
+ 	// When loading a file that doesn't belong to a mod dir we only accept KEX saves
++#ifndef LIVE_QUAKE
+ 	if (Cmd_Argc () >= 3 && q_strcasecmp (Cmd_Argv (2), "kex") == 0)
+ 		kexonly = true;
++#endif
+ 
+ 	if (nomonsters.value)
+ 	{
+@@ -2527,9 +2845,14 @@
+ 	q_strlcpy (relname, Cmd_Argv(1), sizeof(relname));
+ 	COM_AddExtension (relname, ".sav", sizeof(relname));
+ 
+-	q_snprintf (name, sizeof(name), "%s/%s", com_gamedir, relname);
++	if ((size_t)q_snprintf (name, sizeof(name), "%s/%s", com_gamedir, relname) >= sizeof (name))
++	{
++		Con_Printf ("ERROR: checkpoint path is too long.\n");
++		return;
++	}
+ 
+ 	// Look for savefile in basedirs instead of gamedir
++#ifndef LIVE_QUAKE
+ 	if (kexonly || !Sys_FileExists (name))
+ 	{
+ 		for (i = com_numbasedirs - 1; i >= 0; i--)
+@@ -2542,6 +2865,7 @@
+ 			}
+ 		}
+ 	}
++#endif
+ 
+ 	if (!Sys_FileExists (name))
+ 	{
+@@ -2560,7 +2884,11 @@
+ 	if (start != NULL)
+ 		free (start);
+ 	
++#ifdef LIVE_QUAKE
++	start = LQ_ReadCheckpoint (name, &declared_edicts, &body_end);
++#else
+ 	start = (char *) COM_LoadMallocFile_TextMode_OSPath(name, NULL);
++#endif
+ 	if (start == NULL)
+ 	{
+ 		Con_Printf ("ERROR: couldn't open.\n");
+@@ -2570,6 +2898,22 @@
+ 	}
+ 
+ 	data = start;
++#ifdef LIVE_QUAKE
++	if (!LQ_SaveHeader (start, body_end, spawn_parms, &saved_skill,
++		mapname, sizeof (mapname), &time, &styles, &body) ||
++		!LQ_SaveBody (body, body_end, declared_edicts))
++	{
++		Con_Printf ("ERROR: checkpoint header/body is incomplete or invalid.\n");
++		free (start);
++		start = NULL;
++		Host_InvalidateSave (relname);
++		SCR_EndLoadingPlaque ();
++		return;
++	}
++	current_skill = saved_skill;
++	Cvar_SetValue ("skill", (float)current_skill);
++	data = styles;
++#else
+ 	data = COM_ParseIntNewline (data, &version);
+ 	if (version == SAVEGAME_VERSION_KEX)
+ 	{
+@@ -2612,7 +2956,9 @@
+ 
+ 	data = COM_ParseStringNewline (data);
+ 	q_strlcpy (mapname, com_token, sizeof(mapname));
+-	data = COM_ParseFloatNewline (data, &time);
++	data = COM_ParseFloatNewline (data, &legacy_time);
++	time = legacy_time;
++#endif
+ 
+ // Note: calling CL_Disconnect instead of CL_Disconnect_f to avoid stopping the music
+ 	CL_Disconnect ();
+@@ -2631,19 +2977,44 @@
+ 		Con_Printf ("Couldn't load map\n");
+ 		return;
+ 	}
++#ifdef LIVE_QUAKE
++	if (declared_edicts > qcvm->max_edicts || declared_edicts < svs.maxclients + 1)
++	{
++		PR_SwitchQCVM (NULL);
++		free (start);
++		start = NULL;
++		SCR_EndLoadingPlaque ();
++		Con_Printf ("ERROR: checkpoint entity count exceeds this server's bounds.\n");
++		return;
++	}
++#endif
+ 	sv.paused = true;		// pause until all clients connect
+ 	sv.loadgame = true;
+ 
+ // load the light styles
+ 	for (i = 0; i < MAX_LIGHTSTYLES; i++)
+ 	{
++#ifdef LIVE_QUAKE
++		const char *line;
++		size_t length;
++		if (!LQ_SaveLine (&data, body_end, &line, &length))
++			Host_Error ("Checkpoint light styles are incomplete");
++		((char *)line)[length] = 0;
++		sv.lightstyles[i] = (const char *)Hunk_Strdup (line, "lightstyles");
++		((char *)line)[length] = '\n';
++#else
+ 		data = COM_ParseStringNewline (data);
+ 		sv.lightstyles[i] = (const char *)Hunk_Strdup (com_token, "lightstyles");
++#endif
+ 	}
+ 
+ // load the edicts out of the savegame file
+ 	entnum = -1;		// -1 is the globals
++#ifdef LIVE_QUAKE
++	while (entnum < declared_edicts)
++#else
+ 	while (*data)
++#endif
+ 	{
+ 		data = COM_Parse (data);
+ 		if (!com_token[0])
+@@ -2659,6 +3030,10 @@
+ 		}
+ 		else
+ 		{	// parse an edict
++#ifdef LIVE_QUAKE
++			if (entnum >= qcvm->max_edicts)
++				Host_Error ("Checkpoint entity index exceeds this server's bounds");
++#endif
+ 			ent = EDICT_NUM(entnum);
+ 			if (entnum < qcvm->num_edicts)
+ 			{
+@@ -2678,6 +3053,10 @@
+ 
+ 		entnum++;
+ 	}
++#ifdef LIVE_QUAKE
++	if (entnum != declared_edicts || !LQ_SaveTrailingSpace (data, body_end))
++		Host_Error ("Checkpoint body was not completely consumed");
++#endif
+ 
+ 	// Free edicts allocated during map loading but no longer used after restoring saved game state
+ 	// Note: we use ED_ClearEdict instead of ED_Free to avoid placing entities >= num_edicts in the free list
+@@ -2707,6 +3086,9 @@
+ 
+ 	if (cls.state != ca_dedicated && key_dest == key_game)
+ 		IN_Activate(); // moved to here from M_Load_Key()
++#ifdef LIVE_QUAKE
++	lq_load_result = 1;
++#endif
+ }
+ 
+ //============================================================================
+@@ -3793,4 +4175,3 @@
+ 	Cmd_AddCommand ("viewnext", Host_Viewnext_f);
+ 	Cmd_AddCommand ("viewprev", Host_Viewprev_f);
+ }
+-
+--- a/Quake/main_sdl.c
++++ b/Quake/main_sdl.c
+@@ -28,6 +28,9 @@
+ #include "SDL.h"
+ #endif
+ #include <stdio.h>
++#ifdef LQ_OFFSCREEN
++#include "lq_egl_offscreen.h"
++#endif
+ 
+ static void Sys_AtExit (void)
+ {
+@@ -126,6 +129,9 @@
+ 
+ int main(int argc, char *argv[])
+ {
++#ifdef LQ_OFFSCREEN
++	LQ_EGL_RequireIsolation();
++#endif
+ 	int		t;
+ 	double		time, oldtime, newtime;
+ 
+@@ -138,12 +144,23 @@
+ 	parms.errstate = 0;
+ 
+ 	COM_InitArgv(parms.argc, parms.argv);
++#ifdef LQ_OFFSCREEN
++	if(!COM_CheckParm("-nosound") || !COM_CheckParm("-nojoy") || !COM_CheckParm("-nomouse") ||
++	   !COM_CheckParm("-nosteamapi") || !COM_CheckParm("-noudp") || !COM_CheckParm("-basedir"))
++		Sys_Error("Private proof requires explicit data and disabled sound/input/Steam/network");
++#endif
+ 
+ 	isDedicated = (COM_CheckParm("-dedicated") != 0);
+ 
+ 	Sys_InitSDL ();
+ 
+ 	Sys_Init();
++#ifdef LQ_OFFSCREEN
++	t=COM_CheckParm("-lq-userdir");
++	if(!t || t>=com_argc-1 || com_argv[t+1][0]!='/') Sys_Error("Private proof requires an explicit userdir");
++	parms.userdir=com_argv[t+1];
++	parms.numcpus=2;
++#endif
+ 
+ 	Sys_Printf("Initializing Ironwail v%s\n", IRONWAIL_VER_STRING);
+ 
+@@ -210,6 +227,9 @@
+ 		Host_Frame (time);
+ 
+ 		oldtime = newtime;
++#ifdef LQ_OFFSCREEN
++		if(lq_offscreen_done) Sys_Quit();
++#endif
+ 	}
+ 
+ 	return 0;
+--- a/Quake/pl_linux.c
++++ b/Quake/pl_linux.c
+@@ -91,6 +91,11 @@
+ 
+ void PL_ErrorDialog (const char *errorMsg)
+ {
++#ifdef LQ_OFFSCREEN
++	/* Sys_ReportError already logs the error to stderr before this call. */
++	(void)errorMsg;
++#else
+ 	SDL_ShowSimpleMessageBox (SDL_MESSAGEBOX_ERROR, "Quake Error", errorMsg, NULL);
++#endif
+ }
+ 
+--- a/Quake/pr_edict.c
++++ b/Quake/pr_edict.c
+@@ -593,10 +593,10 @@
+ 		q_snprintf (line, sizeof(line), "void");
+ 		break;
+ 	case ev_float:
+-		q_snprintf (line, sizeof(line), "%f", val->_float);
++		q_snprintf (line, sizeof(line), "%.9g", val->_float);
+ 		break;
+ 	case ev_vector:
+-		q_snprintf (line, sizeof(line), "%f %f %f", val->vector[0], val->vector[1], val->vector[2]);
++		q_snprintf (line, sizeof(line), "%.9g %.9g %.9g", val->vector[0], val->vector[1], val->vector[2]);
+ 		break;
+ 	default:
+ 		q_snprintf (line, sizeof(line), "bad type %i", type);
+@@ -1294,6 +1294,8 @@
+ 				Con_DPrintf ("Can't find field %s\n", s);
+ 			return false;
+ 		}
++		if (def->ofs >= qcvm->progs->numglobals)
++			return false;
+ 		*(int *)d = G_INT(def->ofs);
+ 		break;
+ 
+@@ -1807,6 +1809,8 @@
+ 			maxdefs++;
+ 			if (extrafields[j].type == ev_vector)
+ 				maxdefs+=3;
++			if (maxofs > INT_MAX - type_size[extrafields[j].type])
++				Host_Error ("program entity field count overflow");
+ 			maxofs+=type_size[extrafields[j].type];
+ 		}
+ 	}
+@@ -2014,7 +2018,10 @@
+ {
+ 	const dfunction_t *fa = &qcvm->functions[*(const int *)pa];
+ 	const dfunction_t *fb = &qcvm->functions[*(const int *)pb];
+-	return fa->first_statement - fb->first_statement;
++	// Negative statements are builtin IDs; their full signed range must not
++	// overflow during sorting before the interpreter can reject the call.
++	return (fa->first_statement > fb->first_statement) -
++		(fa->first_statement < fb->first_statement);
+ }
+ 
+ /*
+@@ -2090,6 +2097,48 @@
+ 	}
+ }
+ 
++/* Validate backed file ranges before constructing typed lump pointers or
++ * endian-walking attacker-controlled counts. Subtraction avoids overflow. */
++static qboolean PR_LumpFits (int offset, int count, size_t width, size_t alignment, size_t bytes)
++{
++	return offset >= 0 && count >= 0 && (size_t)offset <= bytes &&
++		(!count || (size_t)offset >= sizeof(dprograms_t)) &&
++		(size_t)offset % alignment == 0 &&
++		(size_t)count <= (bytes - (size_t)offset) / width;
++}
++
++static qboolean PR_RejectProgs (const char *filename, qboolean fatal, const char *reason)
++{
++	// Also preserve optional simple-CSQC rejection/fallback, not a fatal load.
++	if (fatal)
++		Host_Error ("%s: %s", filename, reason);
++	Con_Printf ("%s: %s\n", filename, reason);
++	qcvm->progs = NULL;
++	return false;
++}
++
++static qboolean PR_FunctionMetadataValid (const dfunction_t *f, qboolean interpreted)
++{
++	int i, words = 0;
++	// Builtin dispatch never reads signature/local metadata, including varargs
++	// declarations. Defer #0 declarations until remapping identifies the target.
++	if (!interpreted)
++		return true;
++	if (f->numparms > MAX_PARMS)
++		return false;
++	for (i = 0; i < f->numparms; i++)
++	{
++		if (f->parm_size[i] > 3)
++			return false;
++		words += f->parm_size[i];
++	}
++	if (f->locals < 0 || f->parm_start < 0 || f->parm_start > qcvm->progs->numglobals)
++		return false;
++	return f->locals <= qcvm->progs->numglobals - f->parm_start &&
++		words <= qcvm->progs->numglobals - f->parm_start;
++
++}
++
+ /*
+ ===============
+ PR_LoadProgs
+@@ -2098,6 +2147,7 @@
+ qboolean PR_LoadProgs (const char *filename, qboolean fatal)
+ {
+ 	int			i;
++	size_t		bytes, stride;
+ 
+ 	PR_ClearProgs(qcvm);	//just in case.
+ 
+@@ -2106,7 +2156,14 @@
+ 		return false;
+ 	Con_DPrintf ("Programs occupy %" SDL_PRIs64 "K.\n", com_filesize/1024);
+ 
+-	qcvm->crc = CRC_Block (qcvm->progs, com_filesize);
++	if (com_filesize < (qfileofs_t)sizeof(dprograms_t) || com_filesize > INT_MAX)
++		return PR_RejectProgs (filename, fatal, "invalid program header size");
++	bytes = (size_t)com_filesize;
++	qcvm->crc = CRC_Block (qcvm->progs, (int)bytes);
++	if (qcvm == &sv.qcvm) {
++		extern void LQ_GrenadeProgram(const void *, size_t);
++		LQ_GrenadeProgram(qcvm->progs, bytes);
++	}
+ 
+ 	// byte swap the header
+ 	for (i = 0; i < (int) sizeof(*qcvm->progs) / 4; i++)
+@@ -2162,10 +2219,21 @@
+ 		}
+ 	}
+ 
++	if (!PR_LumpFits (qcvm->progs->ofs_statements, qcvm->progs->numstatements, sizeof(dstatement_t), sizeof(short), bytes) ||
++		!PR_LumpFits (qcvm->progs->ofs_globaldefs, qcvm->progs->numglobaldefs, sizeof(ddef_t), sizeof(int), bytes) ||
++		!PR_LumpFits (qcvm->progs->ofs_fielddefs, qcvm->progs->numfielddefs, sizeof(ddef_t), sizeof(int), bytes) ||
++		!PR_LumpFits (qcvm->progs->ofs_functions, qcvm->progs->numfunctions, sizeof(dfunction_t), sizeof(int), bytes) ||
++		!PR_LumpFits (qcvm->progs->ofs_strings, qcvm->progs->numstrings, sizeof(char), 1, bytes) ||
++		!PR_LumpFits (qcvm->progs->ofs_globals, qcvm->progs->numglobals, sizeof(float), sizeof(float), bytes))
++		return PR_RejectProgs (filename, fatal, "invalid program lump extent");
++	// CRC 5927 is the same supported ABI for SSQC and optional simple CSQC.
++	// Check the original ABI before engine field merging can mask a short file.
++	if (qcvm->progs->numglobals < (int)(sizeof(globalvars_t) / sizeof(float)) ||
++		qcvm->progs->entityfields < (int)(sizeof(entvars_t) / sizeof(float)))
++		return PR_RejectProgs (filename, fatal, "program ABI storage is too small");
++
+ 	qcvm->functions = (dfunction_t *)((byte *)qcvm->progs + qcvm->progs->ofs_functions);
+ 	qcvm->strings = (char *)qcvm->progs + qcvm->progs->ofs_strings;
+-	if (qcvm->progs->ofs_strings + qcvm->progs->numstrings >= com_filesize)
+-		Host_Error ("progs.dat strings go past end of file\n");
+ 
+ 	// initialize the strings
+ 	qcvm->numknownstrings = 0;
+@@ -2201,13 +2269,30 @@
+ 		qcvm->functions[i].s_file = LittleLong (qcvm->functions[i].s_file);
+ 		qcvm->functions[i].numparms = LittleLong (qcvm->functions[i].numparms);
+ 		qcvm->functions[i].locals = LittleLong (qcvm->functions[i].locals);
++		// #0 builtin declarations are remapped later and may have locals == 0.
++		if (!PR_FunctionMetadataValid (&qcvm->functions[i], qcvm->functions[i].first_statement > 0))
++		{
++			PR_ClearProgs (qcvm);
++			return PR_RejectProgs (filename, fatal, "invalid function parameter metadata");
++		}
+ 	}
+ 
+ 	for (i = 0; i < qcvm->progs->numglobaldefs; i++)
+ 	{
++		int type;
+ 		qcvm->globaldefs[i].type = LittleShort (qcvm->globaldefs[i].type);
+ 		qcvm->globaldefs[i].ofs = LittleShort (qcvm->globaldefs[i].ofs);
+ 		qcvm->globaldefs[i].s_name = LittleLong (qcvm->globaldefs[i].s_name);
++		// Known types need their full payload; extension types keep a backed
++		// scalar offset without assuming an unknown extension storage width.
++		type = qcvm->globaldefs[i].type & ~DEF_SAVEGLOBAL;
++		if (qcvm->globaldefs[i].ofs >= qcvm->progs->numglobals ||
++			(type < NUM_TYPE_SIZES &&
++			type_size[type] > qcvm->progs->numglobals - qcvm->globaldefs[i].ofs))
++		{
++			PR_ClearProgs (qcvm);
++			return PR_RejectProgs (filename, fatal, "invalid global definition offset");
++		}
+ 	}
+ 
+ 	for (i = 0; i < qcvm->progs->numfielddefs; i++)
+@@ -2217,10 +2302,26 @@
+ 			Host_Error ("PR_LoadProgs: pr_fielddefs[i].type & DEF_SAVEGLOBAL");
+ 		qcvm->fielddefs[i].ofs = LittleShort (qcvm->fielddefs[i].ofs);
+ 		qcvm->fielddefs[i].s_name = LittleLong (qcvm->fielddefs[i].s_name);
++		if (qcvm->fielddefs[i].type >= NUM_TYPE_SIZES ||
++			qcvm->fielddefs[i].ofs > qcvm->progs->entityfields - type_size[qcvm->fielddefs[i].type])
++		{
++			PR_ClearProgs (qcvm);
++			return PR_RejectProgs (filename, fatal, "invalid field definition payload");
++		}
+ 	}
+ 
+ 	for (i = 0; i < qcvm->progs->numglobals; i++)
+ 		((int *)qcvm->globals)[i] = LittleLong (((int *)qcvm->globals)[i]);
++
++	// Leave room for the fixed engine additions and a signed byte-offset stride.
++	// This is representability, not a mod-specific entity-field limit.
++	stride = (size_t)qcvm->progs->entityfields * sizeof(float) +
++		sizeof(edict_t) - sizeof(entvars_t) + sizeof(void *) - 1;
++	if (stride > INT_MAX - 10 * sizeof(float))
++	{
++		PR_ClearProgs (qcvm);
++		return PR_RejectProgs (filename, fatal, "program entity stride overflow");
++	}
+ 
+ 	//spike: detect extended fields from progs
+ 	PR_MergeEngineFieldDefs ();
+@@ -2236,9 +2337,24 @@
+ 	// properly aligned
+ 	qcvm->edict_size += sizeof(void *) - 1;
+ 	qcvm->edict_size &= ~(sizeof(void *) - 1);
++	// QC entity offsets and several engine spans use signed ints. A final
++	// merged stride must support even the configured maximum capacity.
++	if (qcvm->edict_size > INT_MAX / MAX_EDICTS)
++	{
++		PR_ClearProgs (qcvm);
++		return PR_RejectProgs (filename, fatal, "program entity capacity overflow");
++	}
+ 
+ 	PR_InitHashTables ();
+ 	PR_InitBuiltins ();
++	for (i = 0; i < qcvm->progs->numfunctions; i++)
++	{
++		if (!PR_FunctionMetadataValid (&qcvm->functions[i], qcvm->functions[i].first_statement >= 0))
++		{
++			PR_ClearProgs (qcvm);
++			return PR_RejectProgs (filename, fatal, "invalid interpreted parameter metadata");
++		}
++	}
+ 	PR_PatchRereleaseBuiltins ();
+ 	PR_EnableExtensions ();
+ 	PR_FindSavegameFields ();
+@@ -2249,6 +2365,16 @@
+ 	qcvm->effects_mask = PR_FindSupportedEffects ();
+ 
+ 	return true;
++}
++
++size_t PR_EdictAllocationSize (void)
++{
++	// Check immediately before both SSQC and simple-CSQC allocations. Promote
++	// only after division guards; a signed multiplication must never overflow.
++	if (qcvm->max_edicts <= 0 || qcvm->edict_size <= 0 ||
++		qcvm->max_edicts > INT_MAX / qcvm->edict_size)
++		Host_Error ("invalid entity allocation capacity");
++	return (size_t)qcvm->max_edicts * (size_t)qcvm->edict_size;
+ }
+ 
+ /*
+@@ -2548,11 +2674,11 @@
+ 	fprintf (save->file, "%s\n", save->comment);
+ 
+ 	for (i = 0; i < NUM_SPAWN_PARMS; i++)
+-		fprintf (save->file, "%f\n", save->spawn_parms[i]);
++		fprintf (save->file, "%.9g\n", save->spawn_parms[i]);
+ 
+ 	fprintf (save->file, "%d\n", save->skill);
+ 	fprintf (save->file, "%s\n", save->mapname);
+-	fprintf (save->file, "%f\n", save->time);
++	fprintf (save->file, "%.17g\n", save->time);
+ 
+ 	for (i = 0; i < MAX_LIGHTSTYLES; i++)
+ 		fprintf (save->file, "%s\n", save->lightstyles[i]);
+--- a/Quake/pr_exec.c
++++ b/Quake/pr_exec.c
+@@ -144,39 +144,73 @@
+ PR_PrintStatement
+ =================
+ */
++static const char *PR_DebugString (int offset)
++{
++	size_t available;
++	if (offset < 0 || offset >= qcvm->stringssize || !qcvm->strings)
++		return NULL;
++	available = q_min ((size_t)(qcvm->stringssize - offset), (size_t)128);
++	return memchr (qcvm->strings + offset, 0, available) ? qcvm->strings + offset : NULL;
++}
++
++static void PR_PrintOperand (char label, unsigned short offset, int width)
++{
++	int i;
++	Con_Printf (" %c=%u", label, (unsigned int)offset);
++	if (!width)
++		return;
++	if (!qcvm->globals || offset >= qcvm->progs->numglobals ||
++		width > qcvm->progs->numglobals - offset)
++	{
++		Con_Printf ("<OUT OF RANGE>");
++		return;
++	}
++	// Values are raw words/floats only: never chase a QC pointer or string.
++	Con_Printf ("[");
++	for (i = 0; i < width; i++)
++	{
++		uint32_t word;
++		float value;
++		memcpy (&word, qcvm->globals + offset + i, sizeof(word));
++		memcpy (&value, &word, sizeof(value));
++		Con_Printf ("%s%08x/%.7g", i ? "," : "", (unsigned int)word, (double)value);
++	}
++	Con_Printf ("]");
++}
++
+ static void PR_PrintStatement (dstatement_t *s)
+ {
+-	int	i;
+-
+-	if ((unsigned int)s->op < Q_COUNTOF(pr_opnames))
+-	{
+-		Con_Printf("%s ", pr_opnames[s->op]);
+-		i = strlen(pr_opnames[s->op]);
+-		for ( ; i < 10; i++)
+-			Con_Printf(" ");
+-	}
+-
+-	if (s->op == OP_IF || s->op == OP_IFNOT)
+-		Con_Printf("%sbranch %i", PR_GlobalString(s->a), s->b);
+-	else if (s->op == OP_GOTO)
+-	{
+-		Con_Printf("branch %i", s->a);
+-	}
+-	else if ((unsigned int)(s->op-OP_STORE_F) < 6)
+-	{
+-		Con_Printf("%s", PR_GlobalString(s->a));
+-		Con_Printf("%s", PR_GlobalStringNoContents(s->b));
+-	}
+-	else
+-	{
+-		if (s->a)
+-			Con_Printf("%s", PR_GlobalString(s->a));
+-		if (s->b)
+-			Con_Printf("%s", PR_GlobalString(s->b));
+-		if (s->c)
+-			Con_Printf("%s", PR_GlobalStringNoContents(s->c));
+-	}
+-	Con_Printf("\n");
++	int a = 1, b = 1, c = 1;
++	const char *name = (unsigned int)s->op < Q_COUNTOF(pr_opnames)
++		? pr_opnames[s->op] : "UNKNOWN";
++	// Control-flow displacements have no global value; vector operands have
++	// their complete span checked before printing, including under traceon.
++	switch (s->op)
++	{
++	case OP_DONE: case OP_RETURN: a = 3; b = c = 0; break;
++	case OP_MUL_V: case OP_EQ_V: case OP_NE_V: a = b = 3; break;
++	case OP_MUL_FV: b = c = 3; break;
++	case OP_MUL_VF: a = c = 3; break;
++	case OP_ADD_V: case OP_SUB_V: a = b = c = 3; break;
++	case OP_LOAD_V: c = 3; break;
++	case OP_STORE_V: a = b = 3; c = 0; break;
++	case OP_STOREP_V: a = 3; c = 0; break;
++	case OP_STORE_F: case OP_STORE_S: case OP_STORE_ENT: case OP_STORE_FLD: case OP_STORE_FNC:
++	case OP_STOREP_F: case OP_STOREP_S: case OP_STOREP_ENT: case OP_STOREP_FLD: case OP_STOREP_FNC:
++	case OP_STATE: c = 0; break;
++	case OP_NOT_V: a = 3; b = 0; break;
++	case OP_NOT_F: case OP_NOT_S: case OP_NOT_ENT: case OP_NOT_FNC: b = 0; break;
++	case OP_IF: case OP_IFNOT:
++	case OP_CALL0: case OP_CALL1: case OP_CALL2: case OP_CALL3: case OP_CALL4:
++	case OP_CALL5: case OP_CALL6: case OP_CALL7: case OP_CALL8: b = c = 0; break;
++	case OP_GOTO: a = b = c = 0; break;
++	default: if ((unsigned int)s->op >= Q_COUNTOF(pr_opnames)) a = b = c = 0; break;
++	}
++	Con_Printf ("%s (%u)", name, (unsigned int)s->op);
++	PR_PrintOperand ('a', (unsigned short)s->a, a);
++	PR_PrintOperand ('b', (unsigned short)s->b, b);
++	PR_PrintOperand ('c', (unsigned short)s->c, c);
++	Con_Printf ("\n");
+ }
+ 
+ /*
+@@ -189,7 +223,7 @@
+ 	int		i;
+ 	dfunction_t	*f;
+ 
+-	if (qcvm->depth == 0)
++	if (qcvm->depth <= 0 || qcvm->depth >= MAX_STACK_DEPTH)
+ 	{
+ 		Con_Printf("<NO STACK>\n");
+ 		return;
+@@ -205,7 +239,20 @@
+ 		}
+ 		else
+ 		{
+-			Con_Printf("%12s : %s\n", PR_GetString(f->s_file), PR_GetString(f->s_name));
++			// Names are useful only when their index and bounded termination are
++			// valid; preserve the numeric function fallback without PR_GetString.
++			uintptr_t offset = (uintptr_t)f - (uintptr_t)qcvm->functions;
++			if (offset % sizeof(*f) || offset / sizeof(*f) >= (size_t)qcvm->progs->numfunctions)
++				Con_Printf ("<INVALID FUNCTION>\n");
++			else
++			{
++				const char *file = PR_DebugString (f->s_file);
++				const char *name = PR_DebugString (f->s_name);
++				Con_Printf ("function %zu", offset / sizeof(*f));
++				if (file) Con_Printf (" file=%s", file);
++				if (name) Con_Printf (" name=%s", name);
++				Con_Printf ("\n");
++			}
+ 		}
+ 	}
+ }
+@@ -271,7 +318,10 @@
+ 	q_vsnprintf (string, sizeof(string), error, argptr);
+ 	va_end (argptr);
+ 
+-	PR_PrintStatement(qcvm->statements + qcvm->xstatement);
++	if (qcvm->xstatement >= 0 && qcvm->xstatement < qcvm->progs->numstatements)
++		PR_PrintStatement(qcvm->statements + qcvm->xstatement);
++	else
++		Con_Printf ("statement %d out of range\n", qcvm->xstatement);
+ 	PR_StackTrace();
+ 
+ 	Con_Printf("%s\n", string);
+@@ -290,28 +340,57 @@
+ */
+ static int PR_EnterFunction (dfunction_t *f)
+ {
+-	int	i, j, c, o;
++	int	i, j, c, o, start, numparms, statement;
++	byte widths[MAX_PARMS];
++
++	// Validate before indexing parm_size, touching the local stack, or copying
++	// globals. Builtins do not enter here: their locals may legitimately be 0.
++	if (f->numparms > MAX_PARMS || f->locals < 0 ||
++		f->parm_start < 0 || f->parm_start > qcvm->progs->numglobals ||
++		f->locals > qcvm->progs->numglobals - f->parm_start)
++		PR_RunError ("invalid function locals/parameters");
++	o = 0;
++	for (i = 0; i < f->numparms; i++)
++	{
++		if (f->parm_size[i] > 3)
++			PR_RunError ("invalid parameter width");
++		o += f->parm_size[i];
++	}
++	// Parameter-copy destinations and local save/restore spans are independent.
++	// Stock QC has interpreted functions with active parameters and locals == 0.
++	if (o > qcvm->progs->numglobals - f->parm_start)
++		PR_RunError ("parameters exceed function globals");
++	if (f->first_statement < 0 || f->first_statement >= qcvm->progs->numstatements)
++		PR_RunError ("invalid interpreted function statement");
++	// QC globals may overlap the function lump. Snapshot the validated entry
++	// before saving/copying globals can change that function's metadata.
++	c = f->locals;
++	start = f->parm_start;
++	// Negative counts retain vanilla zero-parameter semantics.
++	numparms = q_max (0, f->numparms);
++	statement = f->first_statement;
++	memcpy (widths, f->parm_size, sizeof(widths));
++	if (qcvm->depth < 0 || qcvm->depth >= MAX_STACK_DEPTH - 1)
++		PR_RunError ("stack overflow");
++	if (qcvm->localstack_used < 0 || qcvm->localstack_used > LOCALSTACK_SIZE ||
++		c > LOCALSTACK_SIZE - qcvm->localstack_used)
++		PR_RunError ("PR_ExecuteProgram: locals stack overflow");
+ 
+ 	qcvm->stack[qcvm->depth].s = qcvm->xstatement;
+ 	qcvm->stack[qcvm->depth].f = qcvm->xfunction;
++	qcvm->stack[qcvm->depth].locals = c;
++	qcvm->stack[qcvm->depth].parm_start = start;
+ 	qcvm->depth++;
+-	if (qcvm->depth >= MAX_STACK_DEPTH)
+-		PR_RunError("stack overflow");
+-
+-	// save off any locals that the new function steps on
+-	c = f->locals;
+-	if (qcvm->localstack_used + c > LOCALSTACK_SIZE)
+-		PR_RunError("PR_ExecuteProgram: locals stack overflow");
+ 
+ 	for (i = 0; i < c ; i++)
+-		qcvm->localstack[qcvm->localstack_used + i] = ((int *)qcvm->globals)[f->parm_start + i];
++		qcvm->localstack[qcvm->localstack_used + i] = ((int *)qcvm->globals)[start + i];
+ 	qcvm->localstack_used += c;
+ 
+ 	// copy parameters
+-	o = f->parm_start;
+-	for (i = 0; i < f->numparms; i++)
+-	{
+-		for (j = 0; j < f->parm_size[i]; j++)
++	o = start;
++	for (i = 0; i < numparms; i++)
++	{
++		for (j = 0; j < widths[i]; j++)
+ 		{
+ 			((int *)qcvm->globals)[o] = ((int *)qcvm->globals)[OFS_PARM0 + i*3 + j];
+ 			o++;
+@@ -319,7 +398,7 @@
+ 	}
+ 
+ 	qcvm->xfunction = f;
+-	return f->first_statement - 1;	// offset the s++
++	return statement - 1;	// offset the s++
+ }
+ 
+ /*
+@@ -329,19 +408,24 @@
+ */
+ static int PR_LeaveFunction (void)
+ {
+-	int	i, c;
+-
+-	if (qcvm->depth <= 0)
++	int	i, c, start;
++	prstack_t *frame;
++
++	if (qcvm->depth <= 0 || qcvm->depth >= MAX_STACK_DEPTH)
+ 		Host_Error("prog stack underflow");
+ 
+-	// Restore locals from the stack
+-	c = qcvm->xfunction->locals;
++	// Restore exactly the span validated on entry, not QC-mutatable metadata.
++	frame = &qcvm->stack[qcvm->depth - 1];
++	c = frame->locals;
++	start = frame->parm_start;
++	if (c < 0 || start < 0 || start > qcvm->progs->numglobals ||
++		c > qcvm->progs->numglobals - start || qcvm->localstack_used < c ||
++		qcvm->localstack_used > LOCALSTACK_SIZE)
++		PR_RunError("PR_ExecuteProgram: invalid saved locals span");
+ 	qcvm->localstack_used -= c;
+-	if (qcvm->localstack_used < 0)
+-		PR_RunError("PR_ExecuteProgram: locals stack underflow");
+ 
+ 	for (i = 0; i < c; i++)
+-		((int *)qcvm->globals)[qcvm->xfunction->parm_start + i] = qcvm->localstack[qcvm->localstack_used + i];
++		((int *)qcvm->globals)[start + i] = qcvm->localstack[qcvm->localstack_used + i];
+ 
+ 	// up stack
+ 	qcvm->depth--;
+@@ -356,7 +440,7 @@
+ */
+ static void PR_CheckBuiltinExtension (dfunction_t *func)
+ {
+-	uint32_t builtin = -func->first_statement;
++	uint32_t builtin = 0u - (uint32_t)func->first_statement;
+ 	uint32_t extnum = qcvm->builtin_ext[builtin];
+ 	uint32_t checked, advertised;
+ 
+@@ -381,6 +465,47 @@
+ 	);
+ }
+ 
++/* QC entity values are byte offsets, not arbitrary addresses. Validate the
++ * exact slot and field payload before forming any typed pointer. Free slots
++ * inside num_edicts remain valid; allocation/lifecycle policy is unchanged. */
++static eval_t *PR_EntityField (int entity, int field, int width, qboolean writing)
++{
++	size_t offset;
++	if (entity < 0 || qcvm->edict_size <= 0 || !qcvm->edicts ||
++		entity % qcvm->edict_size || entity / qcvm->edict_size >= qcvm->num_edicts ||
++		field < 0 || qcvm->progs->entityfields < width ||
++		field > qcvm->progs->entityfields - width)
++		PR_RunError ("invalid entity field access");
++	if (writing && entity == 0 && sv.state == ss_active)
++		PR_RunError ("assignment to world entity");
++	offset = offsetof(edict_t, v) + (size_t)field * sizeof(float);
++	if (offset > (size_t)qcvm->edict_size ||
++		(size_t)width * sizeof(float) > (size_t)qcvm->edict_size - offset ||
++		(size_t)entity + offset > INT_MAX)
++		PR_RunError ("invalid entity field span");
++	return (eval_t *)((byte *)qcvm->edicts + (size_t)entity + offset);
++}
++
++static eval_t *PR_EntityPointer (int pointer, int width)
++{
++	int entity;
++	size_t within, fieldbytes;
++	if (pointer < 0 || qcvm->edict_size <= 0 || !qcvm->edicts)
++		PR_RunError ("invalid entity pointer");
++	entity = pointer / qcvm->edict_size;
++	within = pointer % qcvm->edict_size;
++	if (entity >= qcvm->num_edicts || within < offsetof(edict_t, v))
++		PR_RunError ("entity pointer outside field payload");
++	fieldbytes = within - offsetof(edict_t, v);
++	if (fieldbytes % sizeof(float) || qcvm->progs->entityfields < width ||
++		fieldbytes / sizeof(float) > (size_t)(qcvm->progs->entityfields - width) ||
++		(size_t)width * sizeof(float) > (size_t)qcvm->edict_size - within)
++		PR_RunError ("invalid entity pointer field span");
++	if (entity == 0 && sv.state == ss_active)
++		PR_RunError ("assignment to world entity");
++	return (eval_t *)((byte *)qcvm->edicts + pointer);
++}
++
+ /*
+ ====================
+ PR_ExecuteProgram
+@@ -398,15 +523,10 @@
+ 	dstatement_t	*st;
+ 	dfunction_t	*f, *newf;
+ 	int profile, startprofile;
+-	edict_t		*ed;
+ 	int		exitdepth;
+ 
+-	if (!fnum || fnum >= qcvm->progs->numfunctions)
+-	{
+-		if (pr_global_struct->self)
+-			ED_Print (PROG_TO_EDICT(pr_global_struct->self));
+-		Host_Error ("PR_ExecuteProgram: NULL function");
+-	}
++	if (fnum <= 0 || fnum >= qcvm->progs->numfunctions)
++		Host_Error ("PR_ExecuteProgram: invalid function %d", fnum);
+ 
+ 	f = &qcvm->functions[fnum];
+ 
+@@ -571,27 +691,22 @@
+ 	case OP_STOREP_FLD:	// integers
+ 	case OP_STOREP_S:
+ 	case OP_STOREP_FNC:	// pointers
+-		ptr = (eval_t *)((byte *)qcvm->edicts + OPB->_int);
++		qcvm->xstatement = st - qcvm->statements;
++		ptr = PR_EntityPointer (OPB->_int, 1);
+ 		ptr->_int = OPA->_int;
+ 		break;
+ 	case OP_STOREP_V:
+-		ptr = (eval_t *)((byte *)qcvm->edicts + OPB->_int);
++		qcvm->xstatement = st - qcvm->statements;
++		ptr = PR_EntityPointer (OPB->_int, 3);
+ 		ptr->vector[0] = OPA->vector[0];
+ 		ptr->vector[1] = OPA->vector[1];
+ 		ptr->vector[2] = OPA->vector[2];
+ 		break;
+ 
+ 	case OP_ADDRESS:
+-		ed = PROG_TO_EDICT(OPA->edict);
+-#ifdef PARANOID
+-		NUM_FOR_EDICT(ed);	// Make sure it's in range
+-#endif
+-		if (ed == (edict_t *)qcvm->edicts && sv.state == ss_active)
+-		{
+-			qcvm->xstatement = st - qcvm->statements;
+-			PR_RunError("assignment to world entity");
+-		}
+-		OPC->_int = (byte *)((int *)&ed->v + OPB->_int) - (byte *)qcvm->edicts;
++		qcvm->xstatement = st - qcvm->statements;
++		ptr = PR_EntityField (OPA->edict, OPB->_int, 1, true);
++		OPC->_int = (byte *)ptr - (byte *)qcvm->edicts;
+ 		break;
+ 
+ 	case OP_LOAD_F:
+@@ -599,19 +714,14 @@
+ 	case OP_LOAD_ENT:
+ 	case OP_LOAD_S:
+ 	case OP_LOAD_FNC:
+-		ed = PROG_TO_EDICT(OPA->edict);
+-#ifdef PARANOID
+-		NUM_FOR_EDICT(ed);	// Make sure it's in range
+-#endif
+-		OPC->_int = ((eval_t *)((int *)&ed->v + OPB->_int))->_int;
++		qcvm->xstatement = st - qcvm->statements;
++		ptr = PR_EntityField (OPA->edict, OPB->_int, 1, false);
++		OPC->_int = ptr->_int;
+ 		break;
+ 
+ 	case OP_LOAD_V:
+-		ed = PROG_TO_EDICT(OPA->edict);
+-#ifdef PARANOID
+-		NUM_FOR_EDICT(ed);	// Make sure it's in range
+-#endif
+-		ptr = (eval_t *)((int *)&ed->v + OPB->_int);
++		qcvm->xstatement = st - qcvm->statements;
++		ptr = PR_EntityField (OPA->edict, OPB->_int, 3, false);
+ 		OPC->vector[0] = ptr->vector[0];
+ 		OPC->vector[1] = ptr->vector[1];
+ 		OPC->vector[2] = ptr->vector[2];
+@@ -644,14 +754,14 @@
+ 		startprofile = profile;
+ 		qcvm->xstatement = st - qcvm->statements;
+ 		qcvm->argc = st->op - OP_CALL0;
+-		if (!OPA->function)
+-			PR_RunError("NULL function");
++		if (OPA->function <= 0 || OPA->function >= qcvm->progs->numfunctions)
++			PR_RunError("invalid function %d", OPA->function);
+ 		newf = &qcvm->functions[OPA->function];
+ 		if (newf->first_statement < 0)
+ 		{ // Built-in function
+-			int i = -newf->first_statement;
+-			if (i >= qcvm->numbuiltins)
+-				PR_RunError("Bad builtin call number %d", i);
++			uint32_t i = 0u - (uint32_t)newf->first_statement;
++			if (i >= (uint32_t)qcvm->numbuiltins || i >= MAX_BUILTINS)
++				PR_RunError("Bad builtin call number %u", i);
+ 			PR_CheckBuiltinExtension (newf);
+ 			qcvm->builtins[i]();
+ 			break;
+@@ -676,11 +786,16 @@
+ 		break;
+ 
+ 	case OP_STATE:
+-		ed = PROG_TO_EDICT(pr_global_struct->self);
+-		ed->v.nextthink = pr_global_struct->time + 0.1;
+-		ed->v.frame = OPA->_float;
+-		ed->v.think = OPB->function;
+-		break;
++	{
++		qcvm->xstatement = st - qcvm->statements;
++		eval_t *nextthink = PR_EntityField (pr_global_struct->self, offsetof(entvars_t, nextthink) / sizeof(float), 1, false);
++		eval_t *frame = PR_EntityField (pr_global_struct->self, offsetof(entvars_t, frame) / sizeof(float), 1, false);
++		eval_t *think = PR_EntityField (pr_global_struct->self, offsetof(entvars_t, think) / sizeof(float), 1, false);
++		nextthink->_float = pr_global_struct->time + 0.1;
++		frame->_float = OPA->_float;
++		think->function = OPB->function;
++		break;
++	}
+ 
+ 	default:
+ 		qcvm->xstatement = st - qcvm->statements;
+--- a/Quake/progs.h
++++ b/Quake/progs.h
+@@ -83,6 +83,8 @@
+ {
+ 	int		s;
+ 	dfunction_t	*f;
++	int		locals;		/* validated callee restore span, not QC metadata */
++	int		parm_start;
+ } prstack_t;
+ 
+ typedef struct prhashtable_s
+@@ -316,6 +318,7 @@
+ void PR_ExecuteProgram (func_t fnum);
+ void PR_ClearProgs(qcvm_t *vm);
+ qboolean PR_LoadProgs (const char *filename, qboolean fatal);
++size_t PR_EdictAllocationSize (void);
+ void PR_EnableExtensions (void);
+ void PR_AutoCvarChanged (cvar_t *var);					//updates the autocvar_ globals when their cvar is changed
+ int PR_FindExtensionByName (const char *name);			//returns known extension index, or 0 for unrecognized extensions
+--- a/Quake/sv_main.c
++++ b/Quake/sv_main.c
+@@ -1966,4 +1966,6 @@
+ 	PR_SwitchQCVM(vm);
+ // load progs to get entity field count
+ 	PR_LoadProgs ("progs.dat", true);
++	extern void LQ_ResetSessionSupport(void);
++	LQ_ResetSessionSupport();
+ 
+@@ -1970,7 +1972,7 @@
+ // allocate server memory
+ 	/* Host_ClearMemory() called above already cleared the whole sv structure */
+ 	qcvm->max_edicts = CLAMP (MIN_EDICTS,(int)max_edicts.value,MAX_EDICTS); //johnfitz -- max_edicts cvar
+-	qcvm->edicts = (edict_t *) malloc (qcvm->max_edicts*qcvm->edict_size); // ericw -- sv.edicts switched to use malloc()
++	qcvm->edicts = (edict_t *) malloc (PR_EdictAllocationSize ()); // ericw -- sv.edicts switched to use malloc()
+ 	if (!qcvm->edicts)
+ 		Sys_Error ("SV_SpawnServer: out of memory (%d edicts x %d bytes)", qcvm->max_edicts, qcvm->edict_size);
+ 	ClearLink (&qcvm->free_edicts);
+@@ -2079,4 +2081,3 @@
+ 	if (sv.mapchecks.active)
+ 		SV_PrintMapChecklist ();
+ }
+-
+--- a/Quake/sv_phys.c
++++ b/Quake/sv_phys.c
+@@ -1012,7 +1012,12 @@
+ 
+ 	pr_global_struct->time = qcvm->time;
+ 	pr_global_struct->self = EDICT_TO_PROG(ent);
++	{
++	    extern void LQ_GrenadeBeforeWeapon(edict_t *), LQ_GrenadeAfterWeapon(edict_t *);
++	    LQ_GrenadeBeforeWeapon(ent);
+ 	PR_ExecuteProgram (pr_global_struct->PlayerPostThink);
++	    LQ_GrenadeAfterWeapon(ent);
++	}
+ 
+ 	forceunderwater = !wasunderwater && ent->v.waterlevel >= 3;
+ 	if (forceunderwater != ent->forcewater)
+--- a/Quake/sys_sdl_unix.c
++++ b/Quake/sys_sdl_unix.c
+@@ -424,6 +424,58 @@
+ #endif
+ 
+ static char	cwd[MAX_OSPATH];
++#ifdef LIVE_QUAKE
++static char lq_userdir[MAX_OSPATH];
++
++/* The native frontend supplies an existing private profile. Do not infer a
++ * real user's HOME or create the normal Ironwail user directory. */
++static int Sys_LQReadProfile (const char *path)
++{
++	const char *part, *slash;
++	char component[256];
++	struct stat st;
++	int fd, next, ok = 0;
++	size_t length;
++
++	if (!path || path[0] != '/' || !path[1] ||
++		strlen (path) >= sizeof (lq_userdir) - 64 || strchr (path, '\\'))
++		return 0;
++	for (part = path; *part; part++)
++		if ((unsigned char)*part < 32 || (unsigned char)*part == 127)
++			return 0;
++	fd = open ("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
++	if (fd < 0)
++		return 0;
++	for (part = path + 1; *part; part = slash + 1)
++	{
++		slash = strchr (part, '/');
++		length = slash ? (size_t)(slash - part) : strlen (part);
++		if (!length || length >= sizeof (component) ||
++			(length == 1 && part[0] == '.') ||
++			(length == 2 && part[0] == '.' && part[1] == '.'))
++			goto done;
++		memcpy (component, part, length);
++		component[length] = 0;
++		next = openat (fd, component, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
++		if (next < 0)
++			goto done;
++		close (fd);
++		fd = next;
++		if (!slash)
++			break;
++		if (!slash[1])
++			goto done;
++	}
++	if (fstat (fd, &st) || !S_ISDIR (st.st_mode) || st.st_uid != getuid () ||
++		(st.st_mode & 0777) != 0700)
++		goto done;
++	memcpy (lq_userdir, path, strlen (path) + 1);
++	ok = 1;
++done:
++	close (fd);
++	return ok;
++}
++#endif
+ #ifdef DO_USERDIRS
+ static char	userdir[MAX_OSPATH];
+ 
+@@ -797,11 +849,36 @@
+ 	if (!stdinIsATTY)
+ 		Sys_Printf("Terminal input not available.\n");
+ 
++#ifdef LIVE_QUAKE
++	{
++		int savearg = COM_CheckParm ("-lq-savedir");
++		int basearg = COM_CheckParm ("-basedir");
++		const char *base, *profile;
++		size_t base_length, profile_length;
++		if (!savearg || savearg >= com_argc - 1 ||
++			!basearg || basearg >= com_argc - 1)
++			Sys_Error ("Native Quake requires explicit -basedir and -lq-savedir");
++		base = com_argv[basearg + 1];
++		profile = com_argv[savearg + 1];
++		base_length = strlen (base);
++		profile_length = strlen (profile);
++		if (!Sys_LQReadProfile (profile) || !base_length || base[0] != '/' ||
++			(!strncmp (base, profile, profile_length) &&
++			 (base[profile_length] == '/' || !base[profile_length])) ||
++			(!strncmp (profile, base, base_length) &&
++			 (profile[base_length] == '/' || !profile[base_length])))
++			Sys_Error ("Native save profile must be a separate canonical owned 0700 directory");
++		umask (0077);
++	}
++#endif
++
+ 	memset (cwd, 0, sizeof(cwd));
+ 	Sys_GetBasedir(host_parms->argv[0], cwd, sizeof(cwd));
+ 	host_parms->basedir = cwd;
+ 	host_parms->exedir = Sys_GetExeDir ();
+-#ifndef DO_USERDIRS
++#ifdef LIVE_QUAKE
++	host_parms->userdir = lq_userdir;
++#elif !defined(DO_USERDIRS)
+ 	host_parms->userdir = host_parms->basedir; /* code elsewhere relies on this ! */
+ #else
+ 	memset (userdir, 0, sizeof(userdir));
+--- a/Quake/pr_cmds.c
++++ b/Quake/pr_cmds.c
+@@ -1728,7 +1728,7 @@
+ */
+ static void PF_finalefinished (void)
+ {
+-	G_FLOAT(OFS_RETURN) = 0;
++	G_FLOAT(OFS_RETURN) = SCR_FinaleFinished ();
+ }
+ static void PF_CheckPlayerEXFlags (void)
+ {
+@@ -3365,6 +3365,7 @@
+ 	{"ex_centerprint",			PF_SSQC(PF_centerprint)},				// void(entity client, string s, ...)
+ 	{"ex_bprint",				PF_SSQC(PF_bprint)},					// void(string s, ...)
+ 	{"ex_sprint",				PF_SSQC(PF_sprint)},					// void(entity client, string s, ...)
++	{"ex_finaleFinished",		PF_SSQC(PF_finalefinished)},
+ 	{"ex_finalefinished",		PF_SSQC(PF_finalefinished)},			// float()
+ 	{"ex_CheckPlayerEXFlags",	PF_SSQC(PF_CheckPlayerEXFlags)},		// float(entity playerEnt)
+ 	{"ex_walkpathtogoal",		PF_SSQC(PF_walkpathtogoal)},			// float(float movedist, vector goal)
+--- a/Quake/screen.h
++++ b/Quake/screen.h
+@@ -32,6 +32,7 @@
+ 
+ void SCR_UpdateZoom (void);
+ void SCR_CenterPrint (const char *str);
++qboolean SCR_FinaleFinished (void);
+ 
+ void SCR_BeginLoadingPlaque (void);
+ void SCR_EndLoadingPlaque (void);
+--- a/Quake/host.c
++++ b/Quake/host.c
+@@ -56,6 +56,37 @@
+ client_t	*host_client;			// current client
+ 
+ jmp_buf 	host_abortserver;
++
++/* Bridge commands run outside Host_Frame. Install a live error-recovery target
++ * and restore both the caller's VM and frame clock after errors or redraws. */
++int LQ_ExecuteCommand(const char *command)
++{
++    jmp_buf previous;
++    qcvm_t *previous_vm = qcvm;
++    const double previous_frametime = host_frametime;
++    volatile int ok = 0;
++    memcpy(previous, host_abortserver, sizeof(previous));
++    if (!setjmp(host_abortserver)) {
++        if (!strcmp(command, "lq_refresh")) {
++            host_frametime = 0;
++            SCR_UpdateScreen();
++            ok = 1;
++        } else if (!strcmp(command, "lq_startup")) {
++            /* Finish only the initialization queue before frontend settings.
++             * Never use this path for a paused simulation/control request. */
++            Cbuf_Execute();
++            ok = 1;
++        } else {
++            ok = Cmd_ExecuteString(command, src_command);
++        }
++    }
++    host_frametime = previous_frametime;
++    PR_SwitchQCVM(NULL);
++    PR_SwitchQCVM(previous_vm);
++    memcpy(host_abortserver, previous, sizeof(previous));
++    return ok;
++}
++
+ 
+ byte		*host_colormap;
+ float	host_netinterval;
+@@ -172,10 +203,9 @@
+ 	if (cls.state == ca_dedicated)
+ 		Sys_Error ("Host_EndGame: %s\n",string);	// dedicated servers exit
+ 
+-	if (cls.demonum != -1 && cls.demoloop)
+-		CL_NextDemo ();
+-	else
+-		CL_Disconnect ();
++	cls.demonum = -1;
++	cls.demoloop = false;
++	CL_Disconnect ();
+ 
+ 	longjmp (host_abortserver, 1);
+ }
+@@ -940,6 +970,8 @@
+ Host_ServerFrame
+ ==================
+ */
++extern int LQ_SuspendWorld(void);
++extern int LQ_LocalFrikSession(void);
+ void Host_ServerFrame (void)
+ {
+ 	int		i, active; //johnfitz
+@@ -959,7 +991,7 @@
+ 
+ // move things around and think
+ // always pause in single player if in console or menus
+-	if (!sv.paused && (svs.maxclients > 1 || key_dest == key_game) )
++	if (!sv.paused && !LQ_SuspendWorld() && ((svs.maxclients > 1 && !LQ_LocalFrikSession()) || key_dest == key_game) )
+ 		SV_Physics ();
+ 
+ //johnfitz -- devstats
+@@ -979,6 +1011,11 @@
+ //johnfitz
+ 
+ // send all messages to the clients
++
++#ifdef LIVE_QUAKE
++    extern void LQ_MaintainCamera(void);
++    LQ_MaintainCamera();
++#endif
+ 	SV_SendClientMessages ();
+ 
+ 	Host_CheckAutosave ();
+@@ -1106,7 +1143,7 @@
+ 		    (PR_LoadProgs ("progs.dat", false) && qcvm->extfuncs.CSQC_DrawHud))
+ 		{
+ 			qcvm->max_edicts = CLAMP (MIN_EDICTS, (int)max_edicts.value, MAX_EDICTS);
+-			qcvm->edicts = (edict_t *)malloc (qcvm->max_edicts * qcvm->edict_size);
++			qcvm->edicts = (edict_t *)malloc (PR_EdictAllocationSize ());
+ 			qcvm->num_edicts = qcvm->reserved_edicts = 1;
+ 			memset (qcvm->edicts, 0, qcvm->num_edicts * qcvm->edict_size);
+ 
+@@ -1529,4 +1566,3 @@
+ 
+ 	LOC_Shutdown ();
+ }
+-
+--- a/Quake/sbar.c
++++ b/Quake/sbar.c
+@@ -447,6 +447,10 @@
+ 	for (i = 0; i < cl.maxclients; i++)
+ 	{
++#ifdef LIVE_QUAKE
++        extern int LQ_AmbientCamera(void), LQ_SessionMode(void);
++        if (!i && LQ_SessionMode() && LQ_AmbientCamera()) continue;
++#endif
+ 		if (cl.scores[i].name[0])
+ 		{
+ 			fragsort[scoreboardlines] = i;
+ 			scoreboardlines++;
+@@ -1289,6 +1293,10 @@
+ */
+ void Sbar_DrawFrags (void)
+ {
++#ifdef LIVE_QUAKE
++    extern int LQ_LocalFrikSession(void), LQ_SessionMode(void);
++    if (LQ_LocalFrikSession() && !LQ_SessionMode()) return;
++#endif
+ 	int	numscores, i, x, color;
+ 	char	num[12];
+ 	scoreboard_t	*s;
+@@ -1336,6 +1344,10 @@
+ */
+ void Sbar_DrawFragsQW(void)
+ {
++#ifdef LIVE_QUAKE
++    extern int LQ_LocalFrikSession(void), LQ_SessionMode(void);
++    if (LQ_LocalFrikSession() && !LQ_SessionMode()) return;
++#endif
+ 	int	numscores, i, x, color;
+ 	char	num[12];
+ 	scoreboard_t	*s;
+@@ -1383,6 +1395,10 @@
+ */
+ void Sbar_DrawFrags2 (void)
+ {
++#ifdef LIVE_QUAKE
++    extern int LQ_LocalFrikSession(void), LQ_SessionMode(void);
++    if (LQ_LocalFrikSession() && !LQ_SessionMode()) return;
++#endif
+ 	int		i, x, y, color;
+ 	char	num[12];
+ 
+@@ -1605,8 +1621,21 @@
+ Sbar_Draw
+ ===============
+ */
++static qboolean LQ_HideAmbientDeathScore(void)
++{
++#ifdef LIVE_QUAKE
++    extern int LQ_AmbientCamera(void), LQ_SessionMode(void);
++    return !LQ_SessionMode() && LQ_AmbientCamera();
++#else
++    return false;
++#endif
++}
++
+ void Sbar_Draw (void)
+ {
++#ifdef LIVE_QUAKE
++    extern int LQ_LocalFrikSession(void);
++#endif
+ 	qboolean invuln;
+ 	int armor;
+ 	float x, y, w, h; //johnfitz
+@@ -1643,7 +1672,7 @@
+ 				PR_ExecuteProgram(cl.qcvm.extfuncs.CSQC_DrawScores);
+ 		}
+ 		else
+-			deathmatchoverlay = (sb_showscores || cl.stats[STAT_HEALTH] <= 0);
++			deathmatchoverlay = (sb_showscores || (cl.stats[STAT_HEALTH] <= 0 && !LQ_HideAmbientDeathScore()));
+ 		PR_SwitchQCVM(NULL);
+ 
+ 		if (deathmatchoverlay && cl.gametype == GAME_DEATHMATCH)
+@@ -1714,7 +1743,7 @@
+ 			}
+ 		}
+ 
+-		if (sb_showscores || cl.stats[STAT_HEALTH] <= 0)
++		if (sb_showscores || (cl.stats[STAT_HEALTH] <= 0 && !LQ_HideAmbientDeathScore()))
+ 		{
+ 			Sbar_DrawPicAlpha (0, 0, sb_scorebar, scr_sbaralpha.value); //johnfitz -- scr_sbaralpha
+ 			Sbar_DrawScoreboard ();
+@@ -1770,7 +1799,7 @@
+ 	}
+ 	else
+ 	{
+-		if (sb_showscores || cl.stats[STAT_HEALTH] <= 0)
++		if (sb_showscores || (cl.stats[STAT_HEALTH] <= 0 && !LQ_HideAmbientDeathScore()))
+ 		{
+ 			GL_SetCanvas (CANVAS_SBAR); //johnfitz
+ 			Sbar_DrawPicAlpha (0, 0, sb_scorebar, scr_sbaralpha.value); //johnfitz -- scr_sbaralpha
+@@ -1983,6 +2012,10 @@
+ */
+ void Sbar_MiniDeathmatchOverlay (void)
+ {
++#ifdef LIVE_QUAKE
++    extern int LQ_LocalFrikSession(void), LQ_SessionMode(void), LQ_AmbientCamera(void);
++    if (LQ_LocalFrikSession() && (!LQ_SessionMode() || LQ_AmbientCamera())) return;
++#endif
+ 	int	i, k, top, bottom, x, y, f, numlines;
+ 	char	num[12];
+ 	scoreboard_t	*s;
+--- a/Quake/cmd.c
++++ b/Quake/cmd.c
+@@ -317,11 +317,21 @@
+ 	}
+ 	if (!f)
+ 	{
+-		Con_Printf ("couldn't exec %s\n", path);
++		extern int LQ_LocalFrikSession(void);
++		size_t n = strlen(path);
++		qboolean waypoint = !strncmp(path, "maps/", 5) && n > 4 &&
++			(!strcmp(path+n-4, ".wa1") || !strcmp(path+n-4, ".way"));
++		Con_Printf (waypoint && LQ_LocalFrikSession() ? "[skipnotify]couldn't exec %s\n" : "couldn't exec %s\n", path);
+ 		return;
+ 	}
+ exec:
+-	Con_Printf ("execing %s\n", path);
++	{
++		extern int LQ_LocalFrikSession(void);
++		size_t n = strlen(path);
++		qboolean waypoint = !strncmp(path, "maps/", 5) && n > 4 &&
++			(!strcmp(path+n-4, ".wa1") || !strcmp(path+n-4, ".way"));
++		Con_Printf (waypoint && LQ_LocalFrikSession() ? "[skipnotify]execing %s\n" : "execing %s\n", path);
++	}
+ 
+ 	if (!in_cfg_exec)
+ 	{
+--- a/Quake/sv_user.c
++++ b/Quake/sv_user.c
+@@ -615,6 +615,7 @@
+ SV_RunClients
+ ==================
+ */
++extern int LQ_LocalFrikSession(void);
+ void SV_RunClients (void)
+ {
+ 	int				i;
+@@ -640,7 +641,7 @@
+ 		}
+ 
+ // always pause in single player if in console or menus
+-		if (!sv.paused && (svs.maxclients > 1 || key_dest == key_game) )
++		if (!sv.paused && ((svs.maxclients > 1 && !LQ_LocalFrikSession()) || key_dest == key_game) )
+ 			SV_ClientThink ();
+ 	}
+ }

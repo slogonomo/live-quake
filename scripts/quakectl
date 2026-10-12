@@ -1,0 +1,5 @@
+#!/usr/bin/bash
+# SPDX-License-Identifier: 0BSD
+set -euo pipefail
+root=$(cd -- "$(/usr/bin/dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+exec /usr/bin/python3 -E -s -B "$root/src/controller.py" "$@"
