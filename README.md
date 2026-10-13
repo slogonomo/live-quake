@@ -219,8 +219,7 @@ Until you finish or skip it, the setup guide shows in place of these sections; s
 The settings menu has these sections:
 - **Sound:** game sound while you play, while the bot plays and in the screensaver.
 - **Live background:** whether it's on (this follows your background), whether it shows on empty desktops or all
-  desktops, "Use with this theme" / "Remove from this theme", and "Slipgate theme" when our theme is installed but
-  not in use.
+  desktops, and "Use with this theme" / "Remove from this theme".
 - **Live screensaver:** on or off; off until you turn it on here or finish the setup guide with it ticked. Ownership
   or repeated presentation failures require an explicit retry.
 - **View and controls:** the renderer in use (read-only, with "Retry OpenGL" after repeated failures), blur when
@@ -251,8 +250,7 @@ starts. An upgrade never opens it by itself; it shows in place of the settings t
 Until you finish or skip it, opening Live Quake from Apps shows it.
 
 It has up to four steps:
-1. **Live background:** add it to your current theme, use the Slipgate theme (only when it's on offer; see
-   [Slipgate theme](#slipgate-theme)), or skip it.
+1. **Live background:** add it to your current theme, or skip it.
 2. **Choose your Quake:** LibreQuake, "Find Steam games" or the Steam store. This step shows only while no playable
    Quake from Steam has been found. It looks in Steam once when you reach it, and a game you choose here switches at
    once.
@@ -264,17 +262,6 @@ you press **Finish**, which applies your choices in order and stops at the first
 setup** closes the guide for good and changes nothing. Back undoes nothing. If you close the menu part way, the guide
 picks up where you left off. Its place is kept in `onboarding.json` (see
 [Install, update and removal](#install-update-and-removal)).
-
-## Slipgate theme
-
-Slipgate is an Omarchy theme made for Live Quake, in gunmetal, rust, slime and rune gold, with every colour starting
-from Quake's own palette. Its first background is a Live Quake live background. Choosing it from Live Quake also
-turns the live background on.
-
-It isn't published yet. Until it is, and Live Quake is updated with its address, the setup guide and the menu's
-"Slipgate theme" row offer it only when it's already installed (in `~/.config/omarchy/themes/slipgate`) and not in
-use. Choosing it runs Omarchy's own `omarchy-theme-set slipgate`. That's the one place Live Quake changes your theme,
-and only when you ask; the installer never does.
 
 ## Games
 
@@ -523,8 +510,7 @@ the installer refused every layout of Live Doom files planted in tricky places.
   (under `ironwail-v2-default/` and `profiles/`) and background records;
 - `~/.cache/live-quake/menu-art/` for the menu art cache;
 - `$XDG_RUNTIME_DIR/live-quake/`, mode `0700`;
-- the `1-live-quake.webp` marker, if you choose "Use with this theme" (Remove archives it). The Slipgate theme brings
-  its own Live Quake background.
+- the `1-live-quake.webp` marker, if you choose "Use with this theme" (Remove archives it).
 
 The uninstaller keeps those, so delete them yourself for a full purge. Each game's checkpoint is tied to its
 installed files, so uninstalling and reinstalling (or restoring the free data from a backup) starts LibreQuake fresh.
@@ -552,8 +538,7 @@ It reads your Steam library metadata and game files in place, only when you choo
 setup guide's game step, or start Live Quake with a Steam game chosen, to list what you can play and check your
 choice. File paths stay on your machine and never appear in the menu. If
 you play a Steam game, the menu's art cache (`~/.cache/live-quake/menu-art`) keeps menu pictures and sounds drawn
-from it. Once the Slipgate theme is published and Live Quake is updated with its address, choosing to install it from
-the setup guide or the menu has Omarchy download it from GitHub.
+from it.
 
 ## Credits
 

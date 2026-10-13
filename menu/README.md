@@ -38,9 +38,7 @@ Only through `<plugin>/scripts/quakectl`:
 - `menu opened`, `menu renew` every 2 s, and `menu closed`. A failed renew closes the menu (fail closed).
 - `settings` and `set <key> <json>`.
 - `scan-steam`, `use-game <id>`, `hint-bot`, `retry-renderer`, `use-live-wallpaper` and `remove-live-wallpaper`.
-- The first-run guide (contract v4): `onboarding step|opened|finish|skip`. A window takes no lease. Choosing the
-  Slipgate theme runs Omarchy's own `/usr/bin/omarchy-theme-set` (or `omarchy-theme-install` for a GitHub URL) from
-  the shell session, with a 190 s deadline.
+- The first-run guide (contract v4): `onboarding step|opened|finish|skip`. A window takes no lease.
 
 In deathmatch the Game section adds Round time, Frag limit, Bots and Maps (`set game.dm_timelimit`, `game.dm_fraglimit`
 and `game.dm_bots`). Maps opens a second page, Deathmatch maps, with one row per group (id deathmatch, LibreQuake
