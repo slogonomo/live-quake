@@ -303,23 +303,23 @@ and only when you ask; the installer never does.
 
 `omarchy plugin add` only clones Live Quake into `~/.config/omarchy/plugins/io.github.slogonomo.live-quake`. Live
 Quake builds its engine and bot on your machine, so it needs a one-time manual setup after that. If any of the build
-tools are missing, `omarchy pkg add` asks for your password to install them, so run it in a terminal. Run one line at
-a time. The install line prints its exact plan and asks `Apply exactly this file plan? [y/N]`: read the plan and type
-`y`.
+tools are missing, `omarchy pkg add` asks for your password to install them, so run it in a terminal. Run one command
+at a time. The install line prints its exact plan and asks `Apply exactly this file plan? [y/N]`: read the plan and
+type `y`.
 
 ```sh
 omarchy plugin add https://github.com/slogonomo/live-quake
 cd ~/.config/omarchy/plugins/io.github.slogonomo.live-quake
 omarchy pkg add base-devel git wayland libxkbcommon cairo pkgconf alsa-lib mesa libglvnd sdl2-compat
-inputs=$(mktemp -d)
-git clone https://github.com/id-Software/Quake-Tools "$inputs/quake-tools"
-git -C "$inputs/quake-tools" checkout --quiet c0d1b91c74eb654365ac7755bc837e497caaca73
-git clone https://github.com/fte-team/fteqw "$inputs/fteqw"
-git -C "$inputs/fteqw" checkout --quiet f937b9d88f71fc4429db5fe56c6a98d922711b2e
 work=$(mktemp -d /tmp/live-quake-build.XXXXXX)
 python3 -B scripts/bootstrap-ironwail.py --work-dir "$work" --fetch-sources
 python3 -B scripts/bootstrap.py --work-dir "$work" --fetch-data
-python3 -B scripts/build-frikbot-local.py --base "$inputs/quake-tools" --compiler-source "$inputs/fteqw" --output "$work/bot"
+inputs=$(mktemp -d)
+git clone https://github.com/id-Software/Quake-Tools "$inputs/quake-tools" \
+  && git -C "$inputs/quake-tools" checkout --detach c0d1b91c74eb654365ac7755bc837e497caaca73 \
+  && git clone https://github.com/fte-team/fteqw "$inputs/fteqw" \
+  && git -C "$inputs/fteqw" checkout --detach f937b9d88f71fc4429db5fe56c6a98d922711b2e \
+  && python3 -B scripts/build-frikbot-local.py --base "$inputs/quake-tools" --compiler-source "$inputs/fteqw" --output "$work/bot"
 python3 -B scripts/build-ironwail.py --work-dir "$work" --frikbot-pack "$work/bot/frikbot-local.pak" --frikbot-receipt "$work/bot/frikbot-build.json"
 /usr/bin/python3 -E -s -B scripts/install.py --home "$HOME" install --source "$PWD" --build "$work" --archive "$work/librequake-full.zip"
 omarchy plugin enable io.github.slogonomo.live-quake
@@ -327,7 +327,8 @@ systemctl --user daemon-reload
 systemctl --user enable --now live-quake.service
 ```
 
-- The two `git clone` lines fetch the bot's inputs from [Requirements](#requirements) at their pinned commits.
+- The `git clone` chain fetches the bot's two inputs from [Requirements](#requirements) at their pinned commits, and
+  builds the bot only if both checkouts succeed.
 - The installer reads the plugin folder and never changes it, so `omarchy plugin update` can pull new versions. The
   menu runs from the plugin folder's `menu/`.
 - Everything else (what the downloads are, what the installer writes, the last three lines) is as in
@@ -409,14 +410,14 @@ The installer refuses the whole update if any file it owns has been changed, or 
 exists and isn't its own.
 
 **From the marketplace:** stop Live Quake, pull the new version, rebuild, then install again without
-`--private-copy`. For the rebuild, run the `work=` line and the four build lines from
-[Install from the marketplace](#install-from-the-marketplace); keep or re-clone `$inputs`.
+`--private-copy`. For the rebuild, run the lines from `work=` through `build-ironwail.py` in
+[Install from the marketplace](#install-from-the-marketplace).
 
 ```sh
 systemctl --user stop live-quake.service               # only if you run it
 omarchy plugin update io.github.slogonomo.live-quake
 cd ~/.config/omarchy/plugins/io.github.slogonomo.live-quake
-# rebuild here: the work= line and the four build lines
+# rebuild here: the lines from work= through build-ironwail.py
 /usr/bin/python3 -E -s -B scripts/install.py --home "$HOME" install --source "$PWD" --build "$work" --archive "$work/librequake-full.zip"
 systemctl --user daemon-reload                         # if the plan said the unit changed
 systemctl --user start live-quake.service              # only if you run it
