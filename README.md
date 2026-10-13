@@ -295,14 +295,49 @@ and only when you ask; the installer never does.
 ## Install, update and removal
 
 > **Tested on one real desktop.** The installer has been verified in private, throwaway `HOME` folders with real
-> build artifacts, and on one real desktop from a local checkout with `--private-copy`. The marketplace steps
-> (`omarchy plugin add` and `update`) haven't been tried yet.
+> build artifacts, and on one real desktop from a local checkout with `--private-copy`. The marketplace steps below
+> were run end to end in a throwaway `HOME`, with `omarchy plugin add` done as the plain clone it is; they haven't run
+> on a real desktop yet.
+
+### Install from the marketplace
+
+`omarchy plugin add` only clones Live Quake into `~/.config/omarchy/plugins/io.github.slogonomo.live-quake`. Live
+Quake builds its engine and bot on your machine, so it needs a one-time manual setup after that. If any of the build
+tools are missing, `omarchy pkg add` asks for your password to install them, so run it in a terminal. Run one line at
+a time. The install line prints its exact plan and asks `Apply exactly this file plan? [y/N]`: read the plan and type
+`y`.
+
+```sh
+omarchy plugin add https://github.com/slogonomo/live-quake
+cd ~/.config/omarchy/plugins/io.github.slogonomo.live-quake
+omarchy pkg add base-devel git wayland libxkbcommon cairo pkgconf alsa-lib mesa libglvnd sdl2-compat
+inputs=$(mktemp -d)
+git clone https://github.com/id-Software/Quake-Tools "$inputs/quake-tools"
+git -C "$inputs/quake-tools" checkout --quiet c0d1b91c74eb654365ac7755bc837e497caaca73
+git clone https://github.com/fte-team/fteqw "$inputs/fteqw"
+git -C "$inputs/fteqw" checkout --quiet f937b9d88f71fc4429db5fe56c6a98d922711b2e
+work=$(mktemp -d /tmp/live-quake-build.XXXXXX)
+python3 -B scripts/bootstrap-ironwail.py --work-dir "$work" --fetch-sources
+python3 -B scripts/bootstrap.py --work-dir "$work" --fetch-data
+python3 -B scripts/build-frikbot-local.py --base "$inputs/quake-tools" --compiler-source "$inputs/fteqw" --output "$work/bot"
+python3 -B scripts/build-ironwail.py --work-dir "$work" --frikbot-pack "$work/bot/frikbot-local.pak" --frikbot-receipt "$work/bot/frikbot-build.json"
+/usr/bin/python3 -E -s -B scripts/install.py --home "$HOME" install --source "$PWD" --build "$work" --archive "$work/librequake-full.zip"
+omarchy plugin enable io.github.slogonomo.live-quake
+systemctl --user daemon-reload
+systemctl --user enable --now live-quake.service
+```
+
+- The two `git clone` lines fetch the bot's inputs from [Requirements](#requirements) at their pinned commits.
+- The installer reads the plugin folder and never changes it, so `omarchy plugin update` can pull new versions. The
+  menu runs from the plugin folder's `menu/`.
+- Everything else (what the downloads are, what the installer writes, the last three lines) is as in
+  [Install from a local checkout](#install-from-a-local-checkout).
+- `$inputs` and `$work` can be deleted once the install has finished.
 
 ### Install from a local checkout
 
-This is the only supported way to install today. It builds everything on your machine from a checkout of this
-repository, and copies the plugin into `~/.config/omarchy/plugins/io.github.slogonomo.live-quake`
-(`--private-copy`).
+This is for working on Live Quake. It builds everything on your machine from a checkout of this repository, and
+copies the plugin into `~/.config/omarchy/plugins/io.github.slogonomo.live-quake` (`--private-copy`).
 
 1. **If you installed an earlier version,** update it as in [Update](#update), or remove it first with the
    uninstaller in [Remove](#remove). The uninstaller keeps your settings and saves; to start completely fresh, setup
@@ -371,7 +406,25 @@ the installer asks the running shell which menu it loaded; if it still has the o
 `omarchy restart shell` loads the new one. It never restarts the shell itself.
 
 The installer refuses the whole update if any file it owns has been changed, or if a file it would write already
-exists and isn't its own. `omarchy plugin update` hasn't been tried yet; update from a checkout as above.
+exists and isn't its own.
+
+**From the marketplace:** stop Live Quake, pull the new version, rebuild, then install again without
+`--private-copy`. For the rebuild, run the `work=` line and the four build lines from
+[Install from the marketplace](#install-from-the-marketplace); keep or re-clone `$inputs`.
+
+```sh
+systemctl --user stop live-quake.service               # only if you run it
+omarchy plugin update io.github.slogonomo.live-quake
+cd ~/.config/omarchy/plugins/io.github.slogonomo.live-quake
+# rebuild here: the work= line and the four build lines
+/usr/bin/python3 -E -s -B scripts/install.py --home "$HOME" install --source "$PWD" --build "$work" --archive "$work/librequake-full.zip"
+systemctl --user daemon-reload                         # if the plan said the unit changed
+systemctl --user start live-quake.service              # only if you run it
+omarchy restart shell                                  # loads the new menu
+```
+
+A marketplace install runs the menu from the plugin folder itself, so Omarchy's shell keeps the old menu until it
+restarts.
 
 **If an install or update was interrupted:** nothing is changed automatically. Run
 `… scripts/install.py --home "$HOME" recover --dry-run`, then `--yes`. Every staged file, backup and target is
@@ -406,8 +459,8 @@ How removal behaves:
 - It removes only files it installed that are unchanged.
 - It keeps anything you edited, plus your settings, saves, setup-guide progress and theme background. It reports what
   it kept.
-- For a local install it removes the plugin copy too. A future marketplace install would be removed with
-  `omarchy plugin remove` after running the uninstaller.
+- For a local install it removes the plugin copy too. For a marketplace install, run
+  `omarchy plugin remove io.github.slogonomo.live-quake` after it.
 
 An interrupted screensaver claim can be recovered after stopping Live Quake. Run the installed helper with the same
 explicit HOME, state and runtime directories used by the daemon:
