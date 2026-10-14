@@ -26,7 +26,7 @@ import sys
 import zlib
 from pathlib import Path
 
-CACHE_VERSION = 4
+CACHE_VERSION = 5
 MAX_PAKS = 8
 MAX_PAK_FILES = 4096              # the engine's own limit is 2048 (MAX_FILES_IN_PACK)
 MAX_PIC_W, MAX_PIC_H = 320, 200   # menu pictures fit the engine's 320x200 menu canvas
@@ -38,10 +38,12 @@ MAX_INDEX_BYTES = 1 << 20
 CACHED_NAME = re.compile(r"^[a-z0-9_]{1,24}\.(png|wav)$")
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
-# Menu pictures: gfx/<name>.lmp (qpic: int32 width, int32 height, 8-bit indices; 255 is transparent)
-PICTURES = ("qplaque", "p_option", "ttl_main", "menudot1", "menudot2", "menudot3", "menudot4",
-            "menudot5", "menudot6", "box_tl", "box_tm", "box_tr", "box_ml", "box_mm", "box_mm2",
-            "box_mr", "box_bl", "box_bm", "box_br")
+# Menu pictures: gfx/<name>.lmp (qpic: int32 width, int32 height, 8-bit indices; 255 is transparent).
+# Only the two the menu draws, each capped by what it is, since the shell keeps them decoded: id's data and
+# LibreQuake's are at most 32x144 (qplaque) and 144x28 (p_option).
+PICTURES = ("qplaque", "p_option")
+PICTURE_MAX = {"qplaque": (64, 200), "p_option": (320, 64)}
+FONT_SIZE = 128                     # CONCHARS: 16x16 cells of 8x8
 REQUIRED = ("p_option",)            # the OPTIONS title plaque; everything else is optional
 # The menu's three cues, as the engine uses them (menu.c): move, enter, adjust/back.
 SOUNDS = {"move": "sound/misc/menu1.wav", "enter": "sound/misc/menu2.wav", "adjust": "sound/misc/menu3.wav"}
@@ -144,11 +146,11 @@ def rgba(indices: bytes, palette: bytes, transparent: int) -> bytes:
     return b"".join(lut[c] for c in indices)
 
 
-def qpic(raw: bytes | None) -> tuple[int, int, bytes] | None:
+def qpic(raw: bytes | None, max_size: tuple[int, int]) -> tuple[int, int, bytes] | None:
     if not raw or len(raw) < 8:
         return None
     width, height = struct.unpack_from("<ii", raw, 0)
-    if not (0 < width <= MAX_PIC_W and 0 < height <= MAX_PIC_H) or len(raw) < 8 + width * height:
+    if not (0 < width <= max_size[0] and 0 < height <= max_size[1]) or len(raw) < 8 + width * height:
         return None
     return width, height, raw[8:8 + width * height]
 
@@ -275,10 +277,19 @@ def read_index(out_fd: int, out: Path):
             and isinstance(cached.get("conchars"), dict)
             and isinstance(cached.get("inks"), dict) and sorted(cached["inks"]) == sorted(INKS)):
         return None
-    names = [e.get("file") if isinstance(e, dict) else None
-             for e in list(cached["pictures"].values()) + list(cached["inks"].values()) + [cached["conchars"]]]
-    names += list(cached["sounds"].values())
-    for name in names:
+    if cached["conchars"] != {"file": "conchars.png", "w": FONT_SIZE, "h": FONT_SIZE, "cell": 8}:
+        return None
+    # Every image the shell will decode, with the size it must have.
+    images = [(cached["conchars"]["file"], (FONT_SIZE, FONT_SIZE))]
+    images += [(e.get("file") if isinstance(e, dict) else None, (FONT_SIZE, FONT_SIZE)) for e in cached["inks"].values()]
+    for name, e in cached["pictures"].items():
+        if name not in PICTURE_MAX or not isinstance(e, dict):
+            return None
+        w, h = e.get("w"), e.get("h")
+        if not (type(w) is int and type(h) is int and 0 < w <= PICTURE_MAX[name][0] and 0 < h <= PICTURE_MAX[name][1]):
+            return None
+        images.append((e.get("file"), (w, h)))
+    for name in [n for n, _ in images] + list(cached["sounds"].values()):
         if not CACHED_NAME.match(str(name)):
             return None
         try:
@@ -287,7 +298,25 @@ def read_index(out_fd: int, out: Path):
             return None
         if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_size == 0:
             return None
+    for name, size in images:
+        if png_size(out_fd, name) != size:
+            return None
     return cached
+
+
+def png_size(dir_fd: int, name: str) -> tuple[int, int] | None:
+    """A cached PNG's own width and height, from its IHDR, without following symlinks."""
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd)
+    except OSError:
+        return None
+    try:
+        head = os.read(fd, 24)
+    finally:
+        os.close(fd)
+    if len(head) != 24 or head[:8] != b"\x89PNG\r\n\x1a\n" or head[12:16] != b"IHDR":
+        return None
+    return struct.unpack(">II", head[16:24])
 
 
 def content_key(palette: bytes, conchars: bytes, pictures: dict, sounds: dict) -> str:
@@ -318,12 +347,16 @@ def export(cache_root: Path, paks: list[Path]) -> dict:
         conchars = wad_lump(wad, "conchars") if wad else None
         if not palette or len(palette) != 768 or not conchars or len(conchars) < 128 * 128:
             raise ValueError("this game data has no Quake console font (gfx.wad, gfx/palette.lmp)")
-        conchars = conchars[:128 * 128]
+        conchars = conchars[:FONT_SIZE * FONT_SIZE]
         pictures = {name: game.read(f"gfx/{name}.lmp", MAX_PICTURE_BYTES) for name in PICTURES}
         sounds = {cue: game.read(path, MAX_SOUND_BYTES) for cue, path in SOUNDS.items()}
     finally:
         game.close()
 
+    decoded = {name: qpic(pictures[name], PICTURE_MAX[name]) for name in PICTURES}
+    missing = [name for name in REQUIRED if not decoded[name]]
+    if missing:   # before touching the cache, so a refused data set leaves nothing behind
+        raise ValueError("this game data lacks menu pictures: " + ", ".join(missing))
     out = cache_root / f"{content_key(palette, conchars, pictures, sounds)[:32]}-v{CACHE_VERSION}"
     root_fd = private_dir(cache_root, create=True)
     out_fd = None
@@ -339,23 +372,19 @@ def export(cache_root: Path, paks: list[Path]) -> dict:
             out_fd = private_dir(out, create=False)
 
         # Console font: index 0 is transparent (draw.c turns it into 255 at load).
-        atomic_write(out_fd, "conchars.png", png(128, 128, rgba(conchars, palette, 0)))
+        atomic_write(out_fd, "conchars.png", png(FONT_SIZE, FONT_SIZE, rgba(conchars, palette, 0)))
         inks = {}
         for name, ink in INKS.items():
-            atomic_write(out_fd, f"conchars_{name}.png", png(128, 128, ink_atlas(conchars, palette, ink)))
+            atomic_write(out_fd, f"conchars_{name}.png", png(FONT_SIZE, FONT_SIZE, ink_atlas(conchars, palette, ink)))
             inks[name] = {"file": f"conchars_{name}.png", "color": "#%02x%02x%02x" % ink}
         pics = {}
-        for name in PICTURES:
-            pic = qpic(pictures[name])
+        for name, pic in decoded.items():
             if pic:
                 w, h, px = pic
                 atomic_write(out_fd, f"{name}.png", png(w, h, rgba(px, palette, 255)))
                 # A data set may ship a picture as an empty placeholder (LibreQuake's qplaque is all
                 # transparent): say so, and the menu leaves it out instead of reserving space for it.
                 pics[name] = {"file": f"{name}.png", "w": w, "h": h, "blank": all(c == 255 for c in px)}
-        missing = [name for name in REQUIRED if name not in pics]
-        if missing:
-            raise ValueError("this game data lacks menu pictures: " + ", ".join(missing))
         snd = {}
         for cue, data in sounds.items():
             if data and data[:4] == b"RIFF" and data[8:12] == b"WAVE":
@@ -369,7 +398,7 @@ def export(cache_root: Path, paks: list[Path]) -> dict:
             "version": CACHE_VERSION,
             "dir": str(out),
             "paks": [str(p) for p in paks],
-            "conchars": {"file": "conchars.png", "w": 128, "h": 128, "cell": 8},
+            "conchars": {"file": "conchars.png", "w": FONT_SIZE, "h": FONT_SIZE, "cell": 8},
             # The same font with its text in each of the menu's legible inks (see ink_atlas), laid out identically.
             "inks": inks,
             "pictures": pics,

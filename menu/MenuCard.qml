@@ -142,6 +142,7 @@ Item {
     Image {          // the plaque beside the title, where the data set has one
       visible: !!card.plaque
       source: card.plaque ? card.plaque.url : ""
+      sourceSize: card.plaque ? Qt.size(card.plaque.w, card.plaque.h) : undefined   // decode no larger than the index says
       x: 16 * card.px; y: 4 * card.px
       width: card.plaque ? card.plaque.w * card.px : 0
       height: card.plaque ? card.plaque.h * card.px : 0
@@ -151,6 +152,7 @@ Item {
       id: titleImage
       visible: !!card.title
       source: card.title ? card.title.url : ""
+      sourceSize: card.title ? Qt.size(card.title.w, card.title.h) : undefined
       width: card.title ? card.title.w * card.px : 0
       height: card.title ? card.title.h * card.px : 0
       x: Math.round((card.canvasW - (card.title ? card.title.w : 0)) / 2) * card.px

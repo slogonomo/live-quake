@@ -68,8 +68,7 @@ when it loads `Menu.qml`.
   black. The game's own graphics in the font (rules, cursor, brackets, slider) keep their colours. The inks are part
   of the cache key.
 - `gfx/palette.lmp`
-- `gfx/qplaque.lmp`, `gfx/p_option.lmp`, `gfx/ttl_main.lmp`, `gfx/menudot1..6.lmp` and `gfx/box_*.lmp`: qpic
-  pictures, where index 255 is transparent.
+- `gfx/qplaque.lmp` and `gfx/p_option.lmp`: qpic pictures, where index 255 is transparent.
 - `sound/misc/menu1.wav`, `menu2.wav` and `menu3.wav`: the move, enter and adjust cues.
 
 Every read is bounded:
@@ -77,13 +76,15 @@ Every read is bounded:
   clean error;
 - the PAK directory is capped at 4096 entries;
 - each member's offset and size are checked against the file;
-- per-file caps are 320×200 for pictures (the engine's menu canvas), 1 MiB for sounds and 4 MiB for `gfx.wad`.
+- per-file caps are 64×200 for `qplaque` and 320×64 for `p_option` (id's and LibreQuake's are at most 32×144 and
+  144×28), 1 MiB for sounds and 4 MiB for `gfx.wad`.
 
 The cache directory is named after a length-framed SHA-256 of exactly the bytes it holds. Both the cache root and
 the entry are opened without following symlinks, must be ours, and are kept at `0700`. Every file goes through an
 unguessable temp name, `fsync` and `rename`, relative to that directory's descriptor. `index.json` is written last,
 so a half-written cache is never trusted. A cached index is used only when every file it names is still there, as a
-non-empty regular file of ours; otherwise the art is exported again.
+non-empty regular file of ours, and every image's own PNG header matches the size the index gives it; otherwise the
+art is exported again. The menu also decodes each picture at no more than that size.
 
 Different data sets look different, and the menu follows them:
 
@@ -93,7 +94,6 @@ Different data sets look different, and the menu follows them:
 | CONCHARS 12 / 13 (cursor) | the engine blinks between them | 12 is blank (the menu draws 13, steady) |
 | CONCHARS `(` `)` | full height | short marks low in the cell, so capitals print `[` `]` |
 | `qplaque.lmp` | the Quake plaque | blank (fully transparent) |
-| `menudot*.lmp` | spinning Quake logo | wide bracket highlight |
 | `p_option.lmp` | OPTIONS plaque | OPTIONS plaque (original art) |
 
 `pakart.py` marks a fully transparent picture `"blank": true`, and the menu leaves it out. Only `p_option.lmp` and
